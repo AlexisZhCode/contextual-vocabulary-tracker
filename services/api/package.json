@@ -1,0 +1,17 @@
+{
+  "name": "@vocab/api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js",
+    "build:db": "node scripts/build-ecdict.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "tesseract.js": "^7.0.0"
+  }
+}

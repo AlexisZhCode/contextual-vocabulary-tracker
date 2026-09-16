@@ -1,0 +1,12 @@
+{
+  "name": "contextual-vocabulary-tracker",
+  "private": true,
+  "scripts": {
+    "start": "npm --prefix apps/mobile start",
+    "ios": "npm --prefix apps/mobile run ios",
+    "android": "npm --prefix apps/mobile run android",
+    "api": "npm --prefix services/api run dev",
+    "api:build": "npm --prefix services/api run build:db",
+    "dev": "npm run api & npm start"
+  }
+}

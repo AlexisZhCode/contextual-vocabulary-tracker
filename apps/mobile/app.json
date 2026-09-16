@@ -1,0 +1,62 @@
+{
+  "expo": {
+    "name": "Vocab Bookshelf",
+    "slug": "contextual-vocabulary-tracker",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "scheme": "vocabbookshelf",
+    "newArchEnabled": true,
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.vocab.bookshelf",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Capture book pages to look up vocabulary.",
+        "NSPhotoLibraryUsageDescription": "Import ebook screenshots to look up vocabulary."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#F2F2F7",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "package": "com.vocab.bookshelf",
+      "permissions": [
+        "CAMERA",
+        "READ_MEDIA_IMAGES"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png",
+      "bundler": "metro"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-sqlite",
+      "expo-image",
+      "expo-font",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Import ebook screenshots to look up vocabulary.",
+          "cameraPermission": "Capture book pages to look up vocabulary."
+        }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Capture book pages to look up vocabulary."
+        }
+      ],
+      "expo-audio",
+      "expo-document-picker"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}

@@ -1,0 +1,14 @@
+node_modules/
+.expo/
+dist/
+build/
+*.sqlite
+.DS_Store
+.env
+.env.local
+apps/mobile/.expo/
+apps/mobile/node_modules/
+services/api/node_modules/
+services/api/data/ecdict.csv
+services/api/data/*.7z
+*.log
