@@ -28,6 +28,8 @@ jobs:
 
       - name: Install and export web
         working-directory: apps/mobile
+        env:
+          EXPO_PUBLIC_API_URL: ${{ vars.EXPO_PUBLIC_API_URL }}
         run: |
           npm ci --legacy-peer-deps
           npx expo export --platform web
