@@ -27,10 +27,12 @@ export default function AddSourceScreen() {
   const [title, setTitle] = useState('');
   const [saving, setSaving] = useState(false);
   const [phase, setPhase] = useState('');
+  const [errorMessage, setErrorMessage] = useState('');
 
   const onSave = async () => {
     if (!title.trim() || saving) return;
     setSaving(true);
+    setErrorMessage('');
     try {
       setPhase('Looking up the book…');
       const resolved = await resolveBook(title.trim());
@@ -73,10 +75,9 @@ export default function AddSourceScreen() {
 
       router.replace(`/source/${id}`);
     } catch (error) {
-      Alert.alert(
-        'Could not add book',
-        error instanceof Error ? error.message : String(error),
-      );
+      const message = error instanceof Error ? error.message : String(error);
+      setErrorMessage(message);
+      Alert.alert('Could not add book', message);
     } finally {
       setSaving(false);
       setPhase('');
@@ -118,6 +119,7 @@ export default function AddSourceScreen() {
           )}
         </Pressable>
         {saving && phase ? <Text style={styles.progress}>{phase}</Text> : null}
+        {errorMessage ? <Text style={styles.error}>{errorMessage}</Text> : null}
       </View>
     </KeyboardAvoidingView>
   );
@@ -164,5 +166,11 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     color: colors.textSecondary,
     fontSize: 14,
+  },
+  error: {
+    marginTop: 12,
+    color: colors.danger,
+    fontSize: 14,
+    lineHeight: 20,
   },
 });

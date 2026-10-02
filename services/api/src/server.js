@@ -133,6 +133,59 @@ app.get('/health', (_req, res) => {
   });
 });
 
+const MARKED_TEXT_PROMPT = `Extract vocabulary from this book-page photo.
+
+Find physical marks: underlines, circles, highlights, brackets/boxes.
+For each marked region return JSON objects with:
+- "marked_text": exact marked word/phrase/sentence
+- "context": surrounding sentence
+- "definition": brief Chinese definition
+- "phonetic": IPA or ""
+
+Return ONLY a JSON array. If nothing marked, [].`;
+
+const REGION_TEXT_PROMPT = `Extract the clearest English word(s)/short phrase(s) from this crop.
+Return ONLY a JSON array of:
+- "marked_text"
+- "context" (sentence if visible, else marked_text)
+- "definition" (brief Chinese)
+- "phonetic" (or "")
+If unreadable, [].`;
+
+app.post('/v1/gemini/extract-marked', async (req, res) => {
+  try {
+    const imageBase64 = String(req.body?.imageBase64 || '')
+      .replace(/^data:[^;]+;base64,/, '')
+      .replace(/\s/g, '');
+    if (!imageBase64) {
+      res.status(400).json({ error: 'imageBase64_required' });
+      return;
+    }
+
+    const prompt = req.body?.regionMode ? REGION_TEXT_PROMPT : MARKED_TEXT_PROMPT;
+    const raw = await geminiJson(prompt, {
+      timeoutMs: 90000,
+      image: { data: imageBase64, mimeType: 'image/jpeg' },
+    });
+    const rows = Array.isArray(raw) ? raw : Array.isArray(raw?.items) ? raw.items : [];
+    const items = rows
+      .map((item) => ({
+        marked_text: String(item?.marked_text || item?.markedText || '').trim(),
+        context: String(item?.context || '').trim(),
+        definition: String(item?.definition || '').trim(),
+        phonetic: String(item?.phonetic || '').trim(),
+      }))
+      .filter((item) => item.marked_text);
+    res.json({ items });
+  } catch (err) {
+    console.error('Gemini marked-text extraction failed', err);
+    res.status(502).json({
+      error: 'gemini_extract_failed',
+      message: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
+
 /**
  * Resolve a book by title using Gemini + Open Library cover lookup.
  * Body: { title: string, author?: string }

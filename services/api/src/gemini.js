@@ -56,7 +56,7 @@ function getApiKey() {
   return String(process.env.GEMINI_API_KEY || '').trim();
 }
 
-function buildBody(prompt, model) {
+function buildBody(prompt, model, image) {
   const generationConfig = {
     temperature: 0.2,
     maxOutputTokens: 8192,
@@ -66,8 +66,17 @@ function buildBody(prompt, model) {
   if (!/lite/i.test(model)) {
     generationConfig.thinkingConfig = { thinkingBudget: 0 };
   }
+  const parts = [{ text: prompt }];
+  if (image?.data) {
+    parts.push({
+      inline_data: {
+        mime_type: image.mimeType || 'image/jpeg',
+        data: image.data,
+      },
+    });
+  }
   return {
-    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+    contents: [{ role: 'user', parts }],
     generationConfig,
   };
 }
@@ -75,7 +84,7 @@ function buildBody(prompt, model) {
 /**
  * Call Gemini and parse a JSON response (object or array).
  * @param {string} prompt
- * @param {{ timeoutMs?: number }} [options]
+ * @param {{ timeoutMs?: number, image?: { data: string, mimeType?: string } }} [options]
  */
 export async function geminiJson(prompt, options = {}) {
   const apiKey = getApiKey();
@@ -97,7 +106,7 @@ export async function geminiJson(prompt, options = {}) {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           signal: controller.signal,
-          body: JSON.stringify(buildBody(prompt, model)),
+          body: JSON.stringify(buildBody(prompt, model, options.image)),
         });
 
         if (res.status === 404 || res.status === 400) {

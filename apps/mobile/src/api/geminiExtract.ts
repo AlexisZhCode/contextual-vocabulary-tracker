@@ -1,6 +1,8 @@
 import * as FileSystem from 'expo-file-system/legacy';
 import * as ImageManipulator from 'expo-image-manipulator';
 
+import { resolveApiBase } from './config';
+
 const GEMINI_API_KEY = process.env.EXPO_PUBLIC_GEMINI_API_KEY ?? '';
 
 // Prefer Flash-Lite first (low latency). Keep fuller Flash as fallbacks.
@@ -23,6 +25,41 @@ function geminiEndpoint(model: string) {
 
 function sleep(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+async function extractMarkedTextViaApi(
+  imageBase64: string,
+  options?: GeminiExtractOptions,
+): Promise<MarkedTextItem[]> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 90000);
+  try {
+    const res = await fetch(`${resolveApiBase()}/v1/gemini/extract-marked`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
+      body: JSON.stringify({
+        imageBase64,
+        regionMode: Boolean(options?.regionMode),
+      }),
+    });
+    const payload = (await res.json().catch(() => ({}))) as {
+      items?: MarkedTextItem[];
+      error?: string;
+      message?: string;
+    };
+    if (!res.ok) {
+      throw new Error(payload.message || payload.error || `Gemini request failed (${res.status}).`);
+    }
+    return parseMarkedTextArray(JSON.stringify(payload.items ?? []));
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new Error('Gemini timed out. Try a clearer photo or a smaller image.');
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export type MarkedTextItem = {
@@ -71,10 +108,9 @@ export async function extractMarkedText(
   if (!raw) {
     throw new Error('No image data provided for Gemini extraction.');
   }
-  if (!GEMINI_API_KEY || GEMINI_API_KEY === 'PASTE_YOUR_API_KEY_HERE') {
-    throw new Error(
-      'Gemini API key missing. Add EXPO_PUBLIC_GEMINI_API_KEY to apps/mobile/.env and restart the app.',
-    );
+
+  if (!GEMINI_API_KEY) {
+    return extractMarkedTextViaApi(raw, options);
   }
 
   const prompt = options?.regionMode ? REGION_TEXT_PROMPT : MARKED_TEXT_PROMPT;
