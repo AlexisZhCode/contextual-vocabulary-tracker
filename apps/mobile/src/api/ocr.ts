@@ -270,3 +270,73 @@ export async function cropAndRecognizeWords(input: {
   const words = extractEnglishWords(rawText);
   return { words, rawText, cropUri: manipulated.uri };
 }
+
+/** Detect real pen underlines in a photo and OCR the words above them. */
+export async function recognizePenUnderlinedWords(imageUri: string): Promise<{
+  words: string[];
+  rawText: string;
+}> {
+  const manipulated = await ImageManipulator.manipulateAsync(
+    imageUri,
+    [{ resize: { width: 2200 } }],
+    {
+      compress: 0.85,
+      format: ImageManipulator.SaveFormat.JPEG,
+      base64: true,
+    },
+  );
+
+  let base64 = manipulated.base64;
+  if (!base64 && manipulated.uri) {
+    base64 = await FileSystem.readAsStringAsync(manipulated.uri, {
+      encoding: FileSystem.EncodingType.Base64,
+    });
+  }
+  if (!base64) {
+    throw new Error('Could not read image for pen-underline OCR.');
+  }
+
+  const base = resolveApiBase();
+  if (!base) {
+    throw new Error('No API base URL configured for OCR.');
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 120000);
+  try {
+    const res = await fetch(`${base}/v1/ocr/pen-underlines`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ imageBase64: base64 }),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const detail = await res.text().catch(() => '');
+      throw new Error(
+        `Pen underline OCR failed (${res.status}). Is services/api running? ${detail.slice(0, 160)}`,
+      );
+    }
+    const data = (await res.json()) as { words?: string[]; rawText?: string };
+    const words = Array.isArray(data.words)
+      ? data.words.map((w) => w.toLowerCase()).filter(Boolean)
+      : extractEnglishWords(data.rawText || '');
+    return { words, rawText: (data.rawText || words.join(' ')).trim() };
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new Error('Pen underline OCR timed out. Keep the API running and try a clearer photo.');
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    if (
+      error instanceof TypeError ||
+      /network request failed|could not connect|fetch failed/i.test(message)
+    ) {
+      throw new Error(
+        `Cannot reach OCR API at ${base}. On your Mac run: cd services/api && npm run dev (same Wi‑Fi as the phone).`,
+      );
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+

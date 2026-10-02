@@ -1,4 +1,15 @@
-import type { Entry, LibraryShelf, Source, SourceStatus, SourceWithStats } from '../types';
+import type {
+  Chapter,
+  ChapterDifficulty,
+  ChapterProgressStatus,
+  ChapterSummary,
+  ChapterTreeItem,
+  Entry,
+  LibraryShelf,
+  Source,
+  SourceStatus,
+  SourceWithStats,
+} from '../types';
 import { getDb } from './client';
 
 type SourceRow = {
@@ -27,10 +38,38 @@ type EntryRow = {
   gloss_en: string | null;
   audio_url: string | null;
   sentence: string | null;
+  chapter: string | null;
+  chapter_id: string | null;
   due_at: string | null;
   reviewed_count: number;
   created_at: string;
 };
+
+type ChapterRow = {
+  id: string;
+  source_id: string;
+  position: number;
+  title: string;
+  ai_summary: string | null;
+  status: ChapterProgressStatus;
+  difficulty: ChapterDifficulty | null;
+  finished_at: string | null;
+  word_count?: number;
+};
+
+function parseSummary(raw: string | null): ChapterSummary | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as Partial<ChapterSummary>;
+    return {
+      coreTakeaway: String(parsed.coreTakeaway || '').trim(),
+      bestPart: String(parsed.bestPart || '').trim(),
+      hook: String(parsed.hook || '').trim(),
+    };
+  } catch {
+    return null;
+  }
+}
 
 function mapSource(row: SourceRow): Source {
   return {
@@ -67,9 +106,24 @@ function mapEntry(row: EntryRow): Entry {
     glossEn: row.gloss_en,
     audioUrl: row.audio_url,
     sentence: row.sentence,
+    chapter: row.chapter ?? null,
+    chapterId: row.chapter_id ?? null,
     dueAt: row.due_at,
     reviewedCount: row.reviewed_count,
     createdAt: row.created_at,
+  };
+}
+
+function mapChapter(row: ChapterRow): Chapter {
+  return {
+    id: row.id,
+    sourceId: row.source_id,
+    position: row.position,
+    title: row.title,
+    aiSummary: parseSummary(row.ai_summary),
+    status: row.status || 'unread',
+    difficulty: row.difficulty,
+    finishedAt: row.finished_at,
   };
 }
 
@@ -138,7 +192,22 @@ export async function getSource(id: string): Promise<SourceWithStats | null> {
 export async function listEntriesForSource(sourceId: string): Promise<Entry[]> {
   const db = await getDb();
   const rows = await db.getAllAsync<EntryRow>(
-    `SELECT * FROM entries WHERE source_id = ? ORDER BY created_at DESC`,
+    `SELECT * FROM entries WHERE source_id = ? ORDER BY
+      CASE WHEN chapter IS NULL OR chapter = '' THEN 1 ELSE 0 END,
+      chapter ASC,
+      created_at DESC`,
+    [sourceId],
+  );
+  return rows.map(mapEntry);
+}
+
+/** Words saved from screenshot extraction or typed lookup, outside the AI chapter tree. */
+export async function listUnassignedEntriesForSource(sourceId: string): Promise<Entry[]> {
+  const db = await getDb();
+  const rows = await db.getAllAsync<EntryRow>(
+    `SELECT * FROM entries
+     WHERE source_id = ? AND (chapter_id IS NULL OR chapter_id = '')
+     ORDER BY created_at DESC`,
     [sourceId],
   );
   return rows.map(mapEntry);
@@ -235,13 +304,15 @@ export async function createEntry(input: {
   glossEn?: string | null;
   audioUrl?: string | null;
   sentence?: string | null;
+  chapter?: string | null;
+  chapterId?: string | null;
 }): Promise<void> {
   const db = await getDb();
   const now = new Date().toISOString();
   await db.runAsync(
     `INSERT INTO entries
-      (id, source_id, word, phonetic, pos, gloss_zh, gloss_en, audio_url, sentence, due_at, reviewed_count, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+      (id, source_id, word, phonetic, pos, gloss_zh, gloss_en, audio_url, sentence, chapter, chapter_id, due_at, reviewed_count, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
     [
       input.id,
       input.sourceId,
@@ -252,6 +323,8 @@ export async function createEntry(input: {
       input.glossEn ?? null,
       input.audioUrl ?? null,
       input.sentence ?? null,
+      input.chapter ?? null,
+      input.chapterId ?? null,
       now,
       now,
     ],
@@ -274,4 +347,183 @@ export async function markEntryReviewed(id: string, nextDueAt: string): Promise<
     `UPDATE entries SET reviewed_count = reviewed_count + 1, due_at = ? WHERE id = ?`,
     [nextDueAt, id],
   );
+}
+
+export async function listChaptersForSource(sourceId: string): Promise<ChapterTreeItem[]> {
+  const db = await getDb();
+  const rows = await db.getAllAsync<ChapterRow>(
+    `SELECT c.*,
+       COALESCE(p.status, 'unread') AS status,
+       p.difficulty AS difficulty,
+       p.finished_at AS finished_at,
+       (SELECT COUNT(*) FROM entries e WHERE e.chapter_id = c.id) AS word_count
+     FROM chapters c
+     LEFT JOIN chapter_progress p ON p.chapter_id = c.id
+     WHERE c.source_id = ?
+     ORDER BY c.position ASC`,
+    [sourceId],
+  );
+
+  let previousFinished = true;
+  return rows.map((row) => {
+    const chapter = mapChapter(row);
+    const unlocked = previousFinished;
+    previousFinished = chapter.status === 'finished';
+    return {
+      ...chapter,
+      unlocked,
+      wordCount: row.word_count ?? 0,
+    };
+  });
+}
+
+export async function getChapter(chapterId: string): Promise<ChapterTreeItem | null> {
+  const db = await getDb();
+  const row = await db.getFirstAsync<ChapterRow>(
+    `SELECT c.*,
+       COALESCE(p.status, 'unread') AS status,
+       p.difficulty AS difficulty,
+       p.finished_at AS finished_at,
+       (SELECT COUNT(*) FROM entries e WHERE e.chapter_id = c.id) AS word_count
+     FROM chapters c
+     LEFT JOIN chapter_progress p ON p.chapter_id = c.id
+     WHERE c.id = ?`,
+    [chapterId],
+  );
+  if (!row) return null;
+
+  const siblings = await listChaptersForSource(row.source_id);
+  return siblings.find((c) => c.id === chapterId) ?? null;
+}
+
+export async function listEntriesForChapter(chapterId: string): Promise<Entry[]> {
+  const db = await getDb();
+  const rows = await db.getAllAsync<EntryRow>(
+    `SELECT * FROM entries WHERE chapter_id = ? ORDER BY created_at ASC`,
+    [chapterId],
+  );
+  return rows.map(mapEntry);
+}
+
+export async function replaceChaptersForSource(
+  sourceId: string,
+  chapters: Array<{
+    id: string;
+    position: number;
+    title: string;
+    aiSummary: ChapterSummary | null;
+    words: Array<{
+      id: string;
+      word: string;
+      phonetic?: string | null;
+      pos?: string | null;
+      glossZh: string;
+      glossEn?: string | null;
+      sentence?: string | null;
+    }>;
+  }>,
+): Promise<void> {
+  const db = await getDb();
+  const now = new Date().toISOString();
+
+  const existing = await db.getAllAsync<{ id: string }>(
+    `SELECT id FROM chapters WHERE source_id = ?`,
+    [sourceId],
+  );
+  for (const ch of existing) {
+    await db.runAsync(`DELETE FROM chapter_progress WHERE chapter_id = ?`, [ch.id]);
+    await db.runAsync(`DELETE FROM entries WHERE chapter_id = ?`, [ch.id]);
+  }
+  await db.runAsync(`DELETE FROM chapters WHERE source_id = ?`, [sourceId]);
+
+  for (const ch of chapters) {
+    await db.runAsync(
+      `INSERT INTO chapters (id, source_id, position, title, ai_summary)
+       VALUES (?, ?, ?, ?, ?)`,
+      [
+        ch.id,
+        sourceId,
+        ch.position,
+        ch.title,
+        ch.aiSummary ? JSON.stringify(ch.aiSummary) : null,
+      ],
+    );
+    await db.runAsync(
+      `INSERT INTO chapter_progress (chapter_id, status, difficulty, finished_at)
+       VALUES (?, 'unread', NULL, NULL)`,
+      [ch.id],
+    );
+    for (const w of ch.words) {
+      await db.runAsync(
+        `INSERT INTO entries
+          (id, source_id, word, phonetic, pos, gloss_zh, gloss_en, audio_url, sentence, chapter, chapter_id, due_at, reviewed_count, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 0, ?)`,
+        [
+          w.id,
+          sourceId,
+          w.word.trim().toLowerCase(),
+          w.phonetic ?? null,
+          w.pos ?? null,
+          w.glossZh,
+          w.glossEn ?? null,
+          w.sentence ?? null,
+          ch.title,
+          ch.id,
+          now,
+          now,
+        ],
+      );
+    }
+  }
+
+  if (chapters.length > 0) {
+    await db.runAsync(
+      `UPDATE sources SET last_captured_at = ?, status = CASE WHEN status = 'toRead' THEN 'readingNow' ELSE status END WHERE id = ?`,
+      [now, sourceId],
+    );
+  }
+}
+
+export async function markChapterReading(chapterId: string): Promise<void> {
+  const db = await getDb();
+  const row = await db.getFirstAsync<{ status: string }>(
+    `SELECT status FROM chapter_progress WHERE chapter_id = ?`,
+    [chapterId],
+  );
+  if (!row) {
+    await db.runAsync(
+      `INSERT INTO chapter_progress (chapter_id, status, difficulty, finished_at)
+       VALUES (?, 'reading', NULL, NULL)`,
+      [chapterId],
+    );
+    return;
+  }
+  if (row.status === 'finished') return;
+  await db.runAsync(`UPDATE chapter_progress SET status = 'reading' WHERE chapter_id = ?`, [
+    chapterId,
+  ]);
+}
+
+export async function markChapterFinished(
+  chapterId: string,
+  difficulty: ChapterDifficulty,
+): Promise<void> {
+  const db = await getDb();
+  const now = new Date().toISOString();
+  const row = await db.getFirstAsync<{ chapter_id: string }>(
+    `SELECT chapter_id FROM chapter_progress WHERE chapter_id = ?`,
+    [chapterId],
+  );
+  if (!row) {
+    await db.runAsync(
+      `INSERT INTO chapter_progress (chapter_id, status, difficulty, finished_at)
+       VALUES (?, 'finished', ?, ?)`,
+      [chapterId, difficulty, now],
+    );
+  } else {
+    await db.runAsync(
+      `UPDATE chapter_progress SET status = 'finished', difficulty = ?, finished_at = ? WHERE chapter_id = ?`,
+      [difficulty, now, chapterId],
+    );
+  }
 }

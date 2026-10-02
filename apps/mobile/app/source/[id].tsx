@@ -12,10 +12,11 @@ import {
   View,
 } from 'react-native';
 
+import { prepareBookChapters } from '../../src/api/booksAi';
 import { ScreenHeader } from '../../src/components/ScreenHeader';
 import * as queries from '../../src/db/queries';
 import { colors, radii } from '../../src/theme/colors';
-import type { Entry, SourceStatus, SourceWithStats } from '../../src/types';
+import type { ChapterTreeItem, Entry, SourceStatus, SourceWithStats } from '../../src/types';
 
 const STATUS_OPTIONS: { value: SourceStatus; label: string }[] = [
   { value: 'toRead', label: 'To Read' },
@@ -24,23 +25,31 @@ const STATUS_OPTIONS: { value: SourceStatus; label: string }[] = [
   { value: 'abandoned', label: 'Abandoned' },
 ];
 
+function createId(prefix: string) {
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
 export default function SourceDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const router = useRouter();
   const [source, setSource] = useState<SourceWithStats | null>(null);
-  const [entries, setEntries] = useState<Entry[]>([]);
+  const [chapters, setChapters] = useState<ChapterTreeItem[]>([]);
+  const [savedWords, setSavedWords] = useState<Entry[]>([]);
   const [loading, setLoading] = useState(true);
+  const [generating, setGenerating] = useState(false);
 
   const refresh = useCallback(async () => {
     if (!id) return;
     setLoading(true);
     try {
-      const [s, e] = await Promise.all([
+      const [s, ch, words] = await Promise.all([
         queries.getSource(id),
-        queries.listEntriesForSource(id),
+        queries.listChaptersForSource(id),
+        queries.listUnassignedEntriesForSource(id),
       ]);
       setSource(s);
-      setEntries(e);
+      setChapters(ch);
+      setSavedWords(words);
     } finally {
       setLoading(false);
     }
@@ -51,6 +60,42 @@ export default function SourceDetailScreen() {
       void refresh();
     }, [refresh]),
   );
+
+  const onGenerateTree = async () => {
+    if (!source || generating) return;
+    setGenerating(true);
+    try {
+      const prepared = await prepareBookChapters(source.title, source.author, {
+        maxChapters: 8,
+      });
+      await queries.replaceChaptersForSource(
+        source.id,
+        prepared.chapters.map((ch, index) => ({
+          id: createId('ch'),
+          position: index,
+          title: ch.chapter,
+          aiSummary: ch.summary,
+          words: ch.words.map((w) => ({
+            id: createId('ent'),
+            word: w.word,
+            phonetic: w.phonetic,
+            pos: w.pos,
+            glossZh: w.definition || '（暂无中文释义）',
+            glossEn: w.glossEn,
+            sentence: w.context,
+          })),
+        })),
+      );
+      await refresh();
+    } catch (error) {
+      Alert.alert(
+        'Could not build chapters',
+        error instanceof Error ? error.message : String(error),
+      );
+    } finally {
+      setGenerating(false);
+    }
+  };
 
   if (loading && !source) {
     return (
@@ -68,6 +113,8 @@ export default function SourceDetailScreen() {
       </View>
     );
   }
+
+  const finishedCount = chapters.filter((c) => c.status === 'finished').length;
 
   return (
     <View style={styles.screen}>
@@ -95,7 +142,9 @@ export default function SourceDetailScreen() {
           <View style={styles.heroMeta}>
             {source.author ? <Text style={styles.author}>{source.author}</Text> : null}
             <Text style={styles.statLine}>
-              {source.wordCount} words · {source.dueCount} due
+              {chapters.length
+                ? `${finishedCount} / ${chapters.length} chapters cleared`
+                : `${source.wordCount} words`}
             </Text>
             <View style={styles.actions}>
               <Pressable
@@ -112,31 +161,29 @@ export default function SourceDetailScreen() {
                 />
                 <Text style={styles.chipText}>{source.starred ? 'Starred' : 'Star'}</Text>
               </Pressable>
-                <Pressable
-                  style={styles.chip}
-                  onPress={() =>
-                    router.push(
-                      `/lookup?sourceId=${encodeURIComponent(source.id)}` as Href,
-                    )
-                  }
-                >
-                  <Ionicons name="search" size={16} color={colors.link} />
-                  <Text style={[styles.chipText, { color: colors.link }]}>Type</Text>
-                </Pressable>
-                <Pressable
-                  style={styles.chip}
-                  onPress={() =>
-                    router.push({ pathname: '/capture', params: { sourceId: source.id } })
-                  }
-                >
-                  <Ionicons name="scan-outline" size={16} color={colors.link} />
-                  <Text style={[styles.chipText, { color: colors.link }]}>Look up</Text>
-                </Pressable>
+              <Pressable
+                style={styles.chip}
+                onPress={() =>
+                  router.push(`/lookup?sourceId=${encodeURIComponent(source.id)}` as Href)
+                }
+              >
+                <Ionicons name="search" size={16} color={colors.link} />
+                <Text style={[styles.chipText, { color: colors.link }]}>Type</Text>
+              </Pressable>
+              <Pressable
+                style={styles.chip}
+                onPress={() =>
+                  router.push({ pathname: '/capture', params: { sourceId: source.id } })
+                }
+              >
+                <Ionicons name="scan-outline" size={16} color={colors.link} />
+                <Text style={[styles.chipText, { color: colors.link }]}>Look up</Text>
+              </Pressable>
             </View>
           </View>
         </View>
 
-        <Text style={styles.section}>Status</Text>
+        <Text style={[styles.section, { marginTop: 8, marginBottom: 10 }]}>Status</Text>
         <View style={styles.statusRow}>
           {STATUS_OPTIONS.map((opt) => (
             <Pressable
@@ -159,21 +206,126 @@ export default function SourceDetailScreen() {
           ))}
         </View>
 
-        <Text style={styles.section}>Vocabulary</Text>
-        {entries.length === 0 ? (
-          <Text style={styles.empty}>No words yet. Tap Look up to capture one.</Text>
+        <Text style={styles.section}>Progress Tree</Text>
+        <Text style={styles.treeHint}>
+          Finish a chapter to unlock the next. Summaries stay sealed until you mark finished.
+        </Text>
+
+        {chapters.length === 0 ? (
+          <View style={styles.emptyBox}>
+            <Text style={styles.empty}>
+              No chapter tree yet. Generate one from this book&apos;s structure.
+            </Text>
+            <Pressable
+              style={styles.generateBtn}
+              onPress={() => void onGenerateTree()}
+              disabled={generating}
+            >
+              {generating ? (
+                <ActivityIndicator color="#fff" />
+              ) : (
+                <Text style={styles.generateText}>Build chapter tree</Text>
+              )}
+            </Pressable>
+          </View>
         ) : (
-          entries.map((entry) => (
+          chapters.map((ch, index) => {
+            const done = ch.status === 'finished';
+            const locked = !ch.unlocked;
+            return (
+              <Pressable
+                key={ch.id}
+                style={[styles.chapterRow, locked && styles.chapterLocked]}
+                disabled={locked}
+                onPress={() =>
+                  router.push({
+                    pathname: '/source/[id]/chapter/[chapterId]',
+                    params: { id: source.id, chapterId: ch.id },
+                  })
+                }
+              >
+                <View style={styles.chapterLeft}>
+                  <View style={styles.rail}>
+                    <View style={[styles.dot, done && styles.dotDone, locked && styles.dotLocked]} />
+                    {index < chapters.length - 1 ? (
+                      <View style={[styles.railLine, done && styles.railLineDone]} />
+                    ) : null}
+                  </View>
+                  <View style={styles.chapterMeta}>
+                    <Text
+                      style={[styles.chapterTitle, locked && styles.chapterTitleLocked]}
+                      numberOfLines={2}
+                    >
+                      {ch.title}
+                    </Text>
+                    <Text style={styles.chapterSub}>
+                      {locked
+                        ? 'Locked — finish the previous chapter'
+                        : done
+                          ? 'Finished'
+                          : ch.status === 'reading'
+                            ? 'In progress'
+                            : `${ch.wordCount} words ready`}
+                    </Text>
+                  </View>
+                </View>
+                <Ionicons
+                  name={
+                    done ? 'checkbox' : locked ? 'lock-closed' : 'square-outline'
+                  }
+                  size={26}
+                  color={done ? colors.link : locked ? colors.textTertiary : colors.separator}
+                />
+              </Pressable>
+            );
+          })
+        )}
+
+        <View style={styles.vocabularyHeader}>
+          <View>
+            <Text style={styles.section}>Saved Vocabulary</Text>
+            <Text style={styles.vocabularyHint}>From screenshots and typed lookups</Text>
+          </View>
+          <View style={styles.countBadge}>
+            <Text style={styles.countText}>{savedWords.length}</Text>
+          </View>
+        </View>
+
+        {savedWords.length === 0 ? (
+          <View style={styles.emptyVocabulary}>
+            <Text style={styles.empty}>No saved words yet.</Text>
+            <Pressable
+              style={styles.scanWordsBtn}
+              onPress={() =>
+                router.push({ pathname: '/capture', params: { sourceId: source.id } })
+              }
+            >
+              <Ionicons name="scan-outline" size={17} color={colors.link} />
+              <Text style={styles.scanWordsText}>Scan a page</Text>
+            </Pressable>
+          </View>
+        ) : (
+          savedWords.map((entry) => (
             <Pressable
               key={entry.id}
-              style={styles.entry}
+              style={styles.wordRow}
               onPress={() => router.push(`/word/${entry.id}`)}
             >
-              <View>
-                <Text style={styles.word}>{entry.word}</Text>
-                <Text style={styles.gloss} numberOfLines={1}>
+              <View style={styles.wordMeta}>
+                <View style={styles.wordTitleRow}>
+                  <Text style={styles.word}>{entry.word}</Text>
+                  {entry.phonetic ? (
+                    <Text style={styles.phonetic}>/{entry.phonetic}/</Text>
+                  ) : null}
+                </View>
+                <Text style={styles.gloss} numberOfLines={2}>
                   {entry.glossZh}
                 </Text>
+                {entry.glossEn ? (
+                  <Text style={styles.context} numberOfLines={2}>
+                    {entry.glossEn}
+                  </Text>
+                ) : null}
               </View>
               <Ionicons name="chevron-forward" size={18} color={colors.textTertiary} />
             </Pressable>
@@ -183,7 +335,7 @@ export default function SourceDetailScreen() {
         <Pressable
           style={styles.delete}
           onPress={() =>
-            Alert.alert('Delete source?', 'Words saved under this source will be removed.', [
+            Alert.alert('Delete source?', 'Words and chapter progress will be removed.', [
               { text: 'Cancel', style: 'cancel' },
               {
                 text: 'Delete',
@@ -217,7 +369,7 @@ const styles = StyleSheet.create({
   heroMeta: { flex: 1, justifyContent: 'center', gap: 8 },
   author: { fontSize: 16, color: colors.textSecondary },
   statLine: { fontSize: 14, color: colors.textTertiary },
-  actions: { flexDirection: 'row', gap: 8, marginTop: 4 },
+  actions: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 4 },
   chip: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -231,11 +383,16 @@ const styles = StyleSheet.create({
   section: {
     fontSize: 20,
     fontWeight: '700',
-    marginBottom: 10,
-    marginTop: 8,
     color: colors.text,
+    marginBottom: 8,
   },
-  statusRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 12 },
+  treeHint: {
+    fontSize: 14,
+    lineHeight: 20,
+    color: colors.textSecondary,
+    marginBottom: 14,
+  },
+  statusRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 16 },
   statusChip: {
     backgroundColor: colors.surface,
     paddingHorizontal: 12,
@@ -245,18 +402,98 @@ const styles = StyleSheet.create({
   statusActive: { backgroundColor: colors.text },
   statusText: { fontSize: 13, color: colors.text },
   statusTextActive: { color: colors.surface },
-  entry: {
+  emptyBox: {
     backgroundColor: colors.surface,
     borderRadius: radii.card,
-    padding: 14,
-    marginBottom: 8,
+    padding: 16,
+    gap: 14,
+  },
+  empty: { color: colors.textSecondary, fontSize: 15, lineHeight: 21 },
+  generateBtn: {
+    backgroundColor: colors.text,
+    borderRadius: radii.card,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 14,
+    minHeight: 48,
+  },
+  generateText: { color: '#fff', fontSize: 16, fontWeight: '600' },
+  chapterRow: {
+    backgroundColor: colors.surface,
+    borderRadius: radii.card,
+    paddingHorizontal: 14,
+    paddingVertical: 14,
+    marginBottom: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+  },
+  chapterLocked: { opacity: 0.55 },
+  chapterLeft: { flex: 1, flexDirection: 'row', gap: 12 },
+  rail: { width: 16, alignItems: 'center' },
+  dot: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    backgroundColor: colors.separator,
+    marginTop: 4,
+  },
+  dotDone: { backgroundColor: colors.link },
+  dotLocked: { backgroundColor: colors.textTertiary },
+  railLine: {
+    flex: 1,
+    width: 2,
+    backgroundColor: colors.separatorLight,
+    marginTop: 4,
+    minHeight: 18,
+  },
+  railLineDone: { backgroundColor: colors.link },
+  chapterMeta: { flex: 1, gap: 4 },
+  chapterTitle: { fontSize: 16, fontWeight: '600', color: colors.text },
+  chapterTitleLocked: { color: colors.textSecondary },
+  chapterSub: { fontSize: 13, color: colors.textTertiary },
+  vocabularyHeader: {
+    marginTop: 18,
+    marginBottom: 10,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
   },
-  word: { fontSize: 17, fontWeight: '600', textTransform: 'capitalize' },
-  gloss: { marginTop: 4, color: colors.textSecondary, fontSize: 14, maxWidth: 260 },
-  empty: { color: colors.textSecondary, fontSize: 15 },
+  vocabularyHint: { marginTop: 2, fontSize: 13, color: colors.textTertiary },
+  countBadge: {
+    minWidth: 30,
+    height: 30,
+    borderRadius: 15,
+    paddingHorizontal: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: colors.separatorLight,
+  },
+  countText: { fontSize: 14, fontWeight: '700', color: colors.textSecondary },
+  emptyVocabulary: {
+    padding: 16,
+    borderRadius: radii.card,
+    backgroundColor: colors.surface,
+    gap: 12,
+  },
+  scanWordsBtn: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  scanWordsText: { fontSize: 15, fontWeight: '600', color: colors.link },
+  wordRow: {
+    padding: 14,
+    marginBottom: 8,
+    borderRadius: radii.card,
+    backgroundColor: colors.surface,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  wordMeta: { flex: 1 },
+  wordTitleRow: { flexDirection: 'row', alignItems: 'baseline', flexWrap: 'wrap', gap: 8 },
+  word: { fontSize: 17, fontWeight: '700', color: colors.text, textTransform: 'capitalize' },
+  phonetic: { fontSize: 13, color: colors.textTertiary },
+  gloss: { marginTop: 4, fontSize: 14, color: colors.textSecondary },
+  context: { marginTop: 5, fontSize: 13, lineHeight: 18, color: colors.textTertiary },
   delete: { marginTop: 28, alignItems: 'center', padding: 14 },
   deleteText: { color: colors.danger, fontSize: 16 },
 });

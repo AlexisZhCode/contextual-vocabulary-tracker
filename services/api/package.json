@@ -12,6 +12,7 @@
     "better-sqlite3": "^11.10.0",
     "cors": "^2.8.5",
     "express": "^5.1.0",
+    "jpeg-js": "^0.4.4",
     "tesseract.js": "^7.0.0"
   }
 }

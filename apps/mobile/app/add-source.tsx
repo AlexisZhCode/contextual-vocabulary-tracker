@@ -2,6 +2,7 @@ import { useRouter } from 'expo-router';
 import { useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -11,7 +12,8 @@ import {
   View,
 } from 'react-native';
 
-import { fallbackColorForTitle, searchCover } from '../src/api/dictionary';
+import { prepareBookChapters, resolveBook } from '../src/api/booksAi';
+import { fallbackColorForTitle } from '../src/api/dictionary';
 import { ScreenHeader } from '../src/components/ScreenHeader';
 import * as queries from '../src/db/queries';
 import { colors, radii } from '../src/theme/colors';
@@ -23,26 +25,61 @@ function createId(prefix: string) {
 export default function AddSourceScreen() {
   const router = useRouter();
   const [title, setTitle] = useState('');
-  const [author, setAuthor] = useState('');
   const [saving, setSaving] = useState(false);
+  const [phase, setPhase] = useState('');
 
   const onSave = async () => {
     if (!title.trim() || saving) return;
     setSaving(true);
     try {
-      const coverUrl = await searchCover(title.trim(), author.trim() || null);
+      setPhase('Looking up the book…');
+      const resolved = await resolveBook(title.trim());
+      const finalTitle = resolved.title || title.trim();
       const id = createId('src');
+
       await queries.createSource({
         id,
-        title: title.trim(),
-        author: author.trim() || null,
-        coverUrl,
-        coverFallback: fallbackColorForTitle(title.trim()),
+        title: finalTitle,
+        author: resolved.author,
+        isbn: resolved.isbn,
+        coverUrl: resolved.coverUrl,
+        coverFallback: fallbackColorForTitle(finalTitle),
         status: 'toRead',
       });
+
+      setPhase('Building chapter tree & vocabulary…');
+      const prepared = await prepareBookChapters(finalTitle, resolved.author, {
+        maxChapters: 8,
+      });
+
+      await queries.replaceChaptersForSource(
+        id,
+        prepared.chapters.map((ch, index) => ({
+          id: createId('ch'),
+          position: index,
+          title: ch.chapter,
+          aiSummary: ch.summary,
+          words: ch.words.map((w) => ({
+            id: createId('ent'),
+            word: w.word,
+            phonetic: w.phonetic,
+            pos: w.pos,
+            glossZh: w.definition || '（暂无中文释义）',
+            glossEn: w.glossEn,
+            sentence: w.context,
+          })),
+        })),
+      );
+
       router.replace(`/source/${id}`);
+    } catch (error) {
+      Alert.alert(
+        'Could not add book',
+        error instanceof Error ? error.message : String(error),
+      );
     } finally {
       setSaving(false);
+      setPhase('');
     }
   };
 
@@ -51,24 +88,23 @@ export default function AddSourceScreen() {
       style={styles.screen}
       behavior={Platform.OS === 'ios' ? 'padding' : undefined}
     >
-      <ScreenHeader title="Add Source" leftLabel="Close" onLeftPress={() => router.back()} />
+      <ScreenHeader title="Add Book" leftLabel="Close" onLeftPress={() => router.back()} />
       <View style={styles.form}>
-        <Text style={styles.label}>Title</Text>
+        <Text style={styles.hint}>
+          Enter the book name. We&apos;ll find the cover and pre-build a chapter Progress Tree with
+          vocabulary + locked summaries.
+        </Text>
+        <Text style={styles.label}>Book name</Text>
         <TextInput
           value={title}
           onChangeText={setTitle}
-          placeholder="Book, PDF, or article title"
+          placeholder="e.g. Humans"
           placeholderTextColor={colors.textTertiary}
           style={styles.input}
           autoFocus
-        />
-        <Text style={styles.label}>Author (optional)</Text>
-        <TextInput
-          value={author}
-          onChangeText={setAuthor}
-          placeholder="Author name"
-          placeholderTextColor={colors.textTertiary}
-          style={styles.input}
+          editable={!saving}
+          returnKeyType="done"
+          onSubmitEditing={() => void onSave()}
         />
         <Pressable
           style={[styles.save, !title.trim() && styles.saveDisabled]}
@@ -81,6 +117,7 @@ export default function AddSourceScreen() {
             <Text style={styles.saveText}>Add to Bookshelf</Text>
           )}
         </Pressable>
+        {saving && phase ? <Text style={styles.progress}>{phase}</Text> : null}
       </View>
     </KeyboardAvoidingView>
   );
@@ -89,6 +126,13 @@ export default function AddSourceScreen() {
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: colors.background },
   form: { paddingHorizontal: 20, gap: 8 },
+  hint: {
+    marginTop: 8,
+    marginBottom: 4,
+    fontSize: 15,
+    lineHeight: 21,
+    color: colors.textSecondary,
+  },
   label: {
     marginTop: 12,
     fontSize: 13,
@@ -111,7 +155,14 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     paddingVertical: 14,
+    minHeight: 50,
   },
   saveDisabled: { opacity: 0.4 },
   saveText: { color: '#fff', fontSize: 17, fontWeight: '600' },
+  progress: {
+    marginTop: 12,
+    textAlign: 'center',
+    color: colors.textSecondary,
+    fontSize: 14,
+  },
 });

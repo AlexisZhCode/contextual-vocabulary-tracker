@@ -8,6 +8,8 @@ build/
 .env.local
 apps/mobile/.expo/
 apps/mobile/node_modules/
+apps/mobile/ios/
+apps/mobile/android/
 services/api/node_modules/
 services/api/data/ecdict.csv
 services/api/data/*.7z

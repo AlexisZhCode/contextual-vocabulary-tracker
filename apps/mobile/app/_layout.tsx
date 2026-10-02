@@ -18,6 +18,10 @@ export default function RootLayout() {
         >
           <Stack.Screen name="(tabs)" />
           <Stack.Screen name="source/[id]" options={{ presentation: 'card' }} />
+          <Stack.Screen
+            name="source/[id]/chapter/[chapterId]"
+            options={{ presentation: 'card' }}
+          />
           <Stack.Screen name="library/[shelf]" options={{ presentation: 'card' }} />
           <Stack.Screen
             name="add-source"

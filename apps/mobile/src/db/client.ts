@@ -4,6 +4,19 @@ import { SEED_ENTRIES, SEED_SOURCES } from '../data/seed';
 
 let dbPromise: Promise<SQLite.SQLiteDatabase> | null = null;
 
+async function ensureColumn(
+  db: SQLite.SQLiteDatabase,
+  table: string,
+  column: string,
+  typeSql: string,
+) {
+  try {
+    await db.execAsync(`ALTER TABLE ${table} ADD COLUMN ${column} ${typeSql}`);
+  } catch {
+    // already exists
+  }
+}
+
 export async function getDb() {
   if (!dbPromise) {
     dbPromise = (async () => {
@@ -25,6 +38,23 @@ export async function getDb() {
           last_captured_at TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS chapters (
+          id TEXT PRIMARY KEY NOT NULL,
+          source_id TEXT NOT NULL,
+          position INTEGER NOT NULL,
+          title TEXT NOT NULL,
+          ai_summary TEXT,
+          FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS chapter_progress (
+          chapter_id TEXT PRIMARY KEY NOT NULL,
+          status TEXT NOT NULL DEFAULT 'unread',
+          difficulty TEXT,
+          finished_at TEXT,
+          FOREIGN KEY (chapter_id) REFERENCES chapters(id) ON DELETE CASCADE
+        );
+
         CREATE TABLE IF NOT EXISTS entries (
           id TEXT PRIMARY KEY NOT NULL,
           source_id TEXT NOT NULL,
@@ -35,6 +65,8 @@ export async function getDb() {
           gloss_en TEXT,
           audio_url TEXT,
           sentence TEXT,
+          chapter TEXT,
+          chapter_id TEXT,
           due_at TEXT,
           reviewed_count INTEGER NOT NULL DEFAULT 0,
           created_at TEXT NOT NULL,
@@ -43,7 +75,11 @@ export async function getDb() {
 
         CREATE INDEX IF NOT EXISTS idx_entries_source ON entries(source_id);
         CREATE INDEX IF NOT EXISTS idx_entries_due ON entries(due_at);
+        CREATE INDEX IF NOT EXISTS idx_chapters_source ON chapters(source_id);
       `);
+
+      await ensureColumn(db, 'entries', 'chapter', 'TEXT');
+      await ensureColumn(db, 'entries', 'chapter_id', 'TEXT');
 
       const row = await db.getFirstAsync<{ count: number }>(
         'SELECT COUNT(*) as count FROM sources',
@@ -71,8 +107,8 @@ export async function getDb() {
         for (const entry of SEED_ENTRIES) {
           await db.runAsync(
             `INSERT INTO entries
-              (id, source_id, word, phonetic, pos, gloss_zh, gloss_en, audio_url, sentence, due_at, reviewed_count, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              (id, source_id, word, phonetic, pos, gloss_zh, gloss_en, audio_url, sentence, chapter, chapter_id, due_at, reviewed_count, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
               entry.id,
               entry.sourceId,
@@ -83,6 +119,8 @@ export async function getDb() {
               entry.glossEn,
               entry.audioUrl,
               entry.sentence,
+              entry.chapter ?? null,
+              entry.chapterId ?? null,
               entry.dueAt,
               entry.reviewedCount,
               entry.createdAt,

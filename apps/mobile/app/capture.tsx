@@ -3,7 +3,7 @@ import * as DocumentPicker from 'expo-document-picker';
 import { Image } from 'expo-image';
 import * as ImagePicker from 'expo-image-picker';
 import { useLocalSearchParams, useRouter } from 'expo-router';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -20,13 +20,24 @@ import {
   View,
 } from 'react-native';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
+import Animated, {
+  runOnJS,
+  useAnimatedStyle,
+  useSharedValue,
+  withTiming,
+} from 'react-native-reanimated';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import Svg, { Path, Rect } from 'react-native-svg';
+import Svg, { Path } from 'react-native-svg';
 
 import { lookupWord } from '../src/api/dictionary';
 import {
+  cropUriToJpegBase64,
+  extractMarkedText,
+  imageUriToJpegBase64,
+  type MarkedTextItem,
+} from '../src/api/geminiExtract';
+import {
   boundsFromPoints,
-  cropAndRecognizeWords,
   viewBoundsToImageCrop,
   type Point,
 } from '../src/api/ocr';
@@ -36,6 +47,12 @@ import type { DictionaryResult, SourceWithStats } from '../src/types';
 
 type Mode = 'underline' | 'circle';
 type PickIntent = 'camera' | 'library' | 'upload';
+
+type Stroke = {
+  id: string;
+  mode: Mode;
+  points: Point[];
+};
 
 type ExtractedItem = DictionaryResult & {
   selected: boolean;
@@ -67,7 +84,18 @@ export default function CaptureScreen() {
   const [imageUri, setImageUri] = useState<string | null>(null);
   const [imageSize, setImageSize] = useState<{ width: number; height: number } | null>(null);
   const [mode, setMode] = useState<Mode>('underline');
-  const [stroke, setStroke] = useState<Point[]>([]);
+  const [strokes, setStrokes] = useState<Stroke[]>([]);
+  const activeStrokeIdRef = useRef<string | null>(null);
+  const transformRef = useRef({ scale: 1, tx: 0, ty: 0 });
+  const canvasWindowRef = useRef({ x: 0, y: 0 });
+  const canvasNodeRef = useRef<View>(null);
+  const scaleSV = useSharedValue(1);
+  const txSV = useSharedValue(0);
+  const tySV = useSharedValue(0);
+  const startScaleSV = useSharedValue(1);
+  const startTxSV = useSharedValue(0);
+  const startTySV = useSharedValue(0);
+  const [scrollLocked, setScrollLocked] = useState(false);
   const [extracting, setExtracting] = useState(false);
   const [items, setItems] = useState<ExtractedItem[]>([]);
   const [rawOcr, setRawOcr] = useState('');
@@ -94,9 +122,21 @@ export default function CaptureScreen() {
     setRawOcr('');
   };
 
+  const resetZoom = useCallback(() => {
+    transformRef.current = { scale: 1, tx: 0, ty: 0 };
+    scaleSV.value = withTiming(1, { duration: 160 });
+    txSV.value = withTiming(0, { duration: 160 });
+    tySV.value = withTiming(0, { duration: 160 });
+    startScaleSV.value = 1;
+    startTxSV.value = 0;
+    startTySV.value = 0;
+  }, [scaleSV, startScaleSV, startTxSV, startTySV, txSV, tySV]);
+
   const applyPickedUri = (uri: string) => {
     setImageUri(uri);
-    setStroke([]);
+    setStrokes([]);
+    activeStrokeIdRef.current = null;
+    resetZoom();
     resetExtraction();
     RNImage.getSize(
       uri,
@@ -197,60 +237,86 @@ export default function CaptureScreen() {
     return () => task.cancel();
   }, [intent, autoIntentDone, runIntent]);
 
-  const path = useMemo(() => pointsToPath(stroke), [stroke]);
-  const bounds = useMemo(() => boundsFromPoints(stroke), [stroke]);
+  const finishedStrokes = useMemo(
+    () => strokes.filter((s) => s.points.length >= 2),
+    [strokes],
+  );
 
-  const extractFromStroke = useCallback(async () => {
-    if (!imageUri || !bounds || !imageSize) {
-      Alert.alert('Draw first', 'Underline or circle the word(s) on the image.');
+  const applyMarkedItems = useCallback(async (marked: MarkedTextItem[]) => {
+    if (marked.length === 0) {
+      Alert.alert(
+        'No marked text found',
+        'Gemini did not find underlined, circled, highlighted, or bracketed text. Try a clearer photo.',
+      );
       return;
     }
 
-    const crop = viewBoundsToImageCrop(
-      bounds,
-      { width: PAGE_WIDTH, height: PAGE_HEIGHT },
-      imageSize,
-      mode,
-    );
-    if (!crop) {
-      Alert.alert('Mark a clearer region', 'Try a longer underline or a tighter circle.');
+    setRawOcr(marked.map((m) => m.marked_text).join(' · '));
+
+    const lookedUp: ExtractedItem[] = [];
+    const seen = new Set<string>();
+    for (const item of marked) {
+      const key = item.marked_text.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      const found = await lookupWord(item.marked_text).catch(() => null);
+      lookedUp.push({
+        word: found?.word ?? item.marked_text,
+        phonetic: item.phonetic || found?.phonetic || null,
+        pos: found?.pos ?? null,
+        glossZh: item.definition || found?.glossZh || '（未找到释义）',
+        glossEn: item.context || found?.glossEn || null,
+        audioUrl: found?.audioUrl ?? null,
+        selected: Boolean(item.definition || found?.glossZh),
+        status: item.definition || found?.glossZh ? 'ok' : 'missing',
+      });
+    }
+    setItems(lookedUp);
+  }, []);
+
+  const extractFromStroke = useCallback(async () => {
+    if (!imageUri || !imageSize || finishedStrokes.length === 0) {
+      Alert.alert('Draw first', 'Underline or circle the word(s) on the image.');
       return;
     }
 
     setExtracting(true);
     resetExtraction();
     try {
-      const { words, rawText } = await cropAndRecognizeWords({ imageUri, crop });
-      setRawOcr(rawText);
-      if (words.length === 0) {
-        Alert.alert(
-          'No words found',
-          rawText
-            ? `OCR read: “${rawText.slice(0, 120)}” — try marking again.`
-            : 'Could not read text in that region. Try a clearer mark.',
-        );
-        return;
-      }
+      const crops = finishedStrokes
+        .map((stroke) => {
+          const bounds = boundsFromPoints(stroke.points);
+          if (!bounds) return null;
+          return viewBoundsToImageCrop(
+            bounds,
+            { width: PAGE_WIDTH, height: PAGE_HEIGHT },
+            imageSize,
+            stroke.mode,
+          );
+        })
+        .filter((c): c is NonNullable<typeof c> => !!c);
 
-      const lookedUp: ExtractedItem[] = [];
-      for (const word of words) {
-        const found = await lookupWord(word);
-        if (found) {
-          lookedUp.push({ ...found, selected: true, status: 'ok' });
-        } else {
-          lookedUp.push({
-            word,
-            phonetic: null,
-            pos: null,
-            glossZh: '（未找到释义）',
-            glossEn: null,
-            audioUrl: null,
-            selected: false,
-            status: 'missing',
-          });
+      // Run Gemini calls in parallel — sequential was the main draw-path bottleneck.
+      const batches = await Promise.all(
+        crops.map(async (crop) => {
+          const base64 = await cropUriToJpegBase64(imageUri, crop);
+          return extractMarkedText(base64, { regionMode: true });
+        }),
+      );
+
+      const merged: MarkedTextItem[] = [];
+      const seen = new Set<string>();
+      for (const items of batches) {
+        for (const item of items) {
+          const key = item.marked_text.toLowerCase();
+          if (seen.has(key)) continue;
+          seen.add(key);
+          merged.push(item);
         }
       }
-      setItems(lookedUp);
+
+      await applyMarkedItems(merged);
     } catch (error) {
       Alert.alert(
         'Could not extract words',
@@ -259,22 +325,238 @@ export default function CaptureScreen() {
     } finally {
       setExtracting(false);
     }
-  }, [imageUri, bounds, imageSize, mode]);
+  }, [imageUri, imageSize, finishedStrokes, applyMarkedItems]);
 
-  const pan = Gesture.Pan()
-    .onBegin((e) => {
-      setStroke([{ x: e.x, y: e.y }]);
-      resetExtraction();
+  const extractPenUnderlines = useCallback(async () => {
+    if (!imageUri) {
+      Alert.alert('Upload a photo', 'Choose a book photo that already has pen marks.');
+      return;
+    }
+
+    setExtracting(true);
+    resetExtraction();
+    try {
+      const base64 = await imageUriToJpegBase64(imageUri);
+      const marked = await extractMarkedText(base64);
+      await applyMarkedItems(marked);
+    } catch (error) {
+      Alert.alert(
+        'Could not extract marked text',
+        error instanceof Error ? error.message : String(error),
+      );
+    } finally {
+      setExtracting(false);
+    }
+  }, [imageUri, applyMarkedItems]);
+
+  const syncTransformRef = (scale: number, tx: number, ty: number) => {
+    transformRef.current = { scale, tx, ty };
+  };
+
+  const setScrollLockedJS = (locked: boolean) => {
+    setScrollLocked(locked);
+  };
+
+  const clampPanWorklet = (scale: number, tx: number, ty: number) => {
+    'worklet';
+    const maxX = ((scale - 1) * PAGE_WIDTH) / 2 + 40;
+    const maxY = ((scale - 1) * PAGE_HEIGHT) / 2 + 40;
+    return {
+      tx: Math.max(-maxX, Math.min(maxX, tx)),
+      ty: Math.max(-maxY, Math.min(maxY, ty)),
+    };
+  };
+
+  /** Map screen (window) touch → unscaled canvas coords (matches SVG / OCR space). */
+  const mapAbsoluteToCanvas = (absoluteX: number, absoluteY: number): Point => {
+    const { scale, tx, ty } = transformRef.current;
+    const s = Math.max(0.01, scale);
+    const cx = PAGE_WIDTH / 2;
+    const cy = PAGE_HEIGHT / 2;
+    const lx = absoluteX - canvasWindowRef.current.x;
+    const ly = absoluteY - canvasWindowRef.current.y;
+    // Inverse of: T(cx+tx, cy+ty) · S(s) · T(-cx, -cy)
+    return {
+      x: (lx - cx - tx) / s + cx,
+      y: (ly - cy - ty) / s + cy,
+    };
+  };
+
+  const undoLastStroke = () => {
+    activeStrokeIdRef.current = null;
+    setStrokes((prev) => {
+      if (prev.length === 0) return prev;
+      return prev.slice(0, -1);
+    });
+    resetExtraction();
+  };
+
+  const pinch = Gesture.Pinch()
+    .onBegin(() => {
+      'worklet';
+      runOnJS(setScrollLockedJS)(true);
+      startScaleSV.value = scaleSV.value;
+      startTxSV.value = txSV.value;
+      startTySV.value = tySV.value;
     })
     .onUpdate((e) => {
-      setStroke((prev) => [...prev, { x: e.x, y: e.y }]);
+      'worklet';
+      const next = Math.min(4, Math.max(1, startScaleSV.value * e.scale));
+      // Zoom about pinch focal point (in the outer canvas / window-relative space).
+      const focalX = e.focalX;
+      const focalY = e.focalY;
+      const cx = PAGE_WIDTH / 2;
+      const cy = PAGE_HEIGHT / 2;
+      const prev = startScaleSV.value;
+      // Point in canvas space under focal before zoom change (using start translate)
+      const canvasX = (focalX - cx - startTxSV.value) / Math.max(0.01, prev) + cx;
+      const canvasY = (focalY - cy - startTySV.value) / Math.max(0.01, prev) + cy;
+      scaleSV.value = next;
+      // Keep that canvas point under the same focal after scale change
+      txSV.value = focalX - cx - (canvasX - cx) * next;
+      tySV.value = focalY - cy - (canvasY - cy) * next;
+      if (next <= 1.01) {
+        scaleSV.value = 1;
+        txSV.value = 0;
+        tySV.value = 0;
+      }
     })
     .onEnd(() => {
-      // Keep stroke; user taps Extract words.
+      'worklet';
+      if (scaleSV.value <= 1.02) {
+        scaleSV.value = 1;
+        txSV.value = 0;
+        tySV.value = 0;
+      }
+      const clamped = clampPanWorklet(scaleSV.value, txSV.value, tySV.value);
+      txSV.value = clamped.tx;
+      tySV.value = clamped.ty;
+      runOnJS(syncTransformRef)(scaleSV.value, clamped.tx, clamped.ty);
+      runOnJS(setScrollLockedJS)(false);
+    })
+    .onFinalize(() => {
+      'worklet';
+      runOnJS(setScrollLockedJS)(false);
+    });
+
+  const twoFingerPan = Gesture.Pan()
+    .minPointers(2)
+    .onBegin(() => {
+      'worklet';
+      runOnJS(setScrollLockedJS)(true);
+      startTxSV.value = txSV.value;
+      startTySV.value = tySV.value;
+    })
+    .onUpdate((e) => {
+      'worklet';
+      if (scaleSV.value <= 1.01) return;
+      const next = clampPanWorklet(
+        scaleSV.value,
+        startTxSV.value + e.translationX,
+        startTySV.value + e.translationY,
+      );
+      txSV.value = next.tx;
+      tySV.value = next.ty;
+    })
+    .onEnd(() => {
+      'worklet';
+      runOnJS(syncTransformRef)(scaleSV.value, txSV.value, tySV.value);
+      runOnJS(setScrollLockedJS)(false);
+    })
+    .onFinalize(() => {
+      'worklet';
+      runOnJS(setScrollLockedJS)(false);
+    });
+
+  const appendPoint = (id: string, point: Point) => {
+    setStrokes((prev) =>
+      prev.map((stroke) =>
+        stroke.id === id ? { ...stroke, points: [...stroke.points, point] } : stroke,
+      ),
+    );
+  };
+
+  const refreshCanvasWindow = useCallback(() => {
+    canvasNodeRef.current?.measureInWindow((x, y) => {
+      canvasWindowRef.current = { x, y };
+    });
+  }, []);
+
+  const beginStroke = (absoluteX: number, absoluteY: number) => {
+    transformRef.current = {
+      scale: scaleSV.value,
+      tx: txSV.value,
+      ty: tySV.value,
+    };
+    const id = createId('stroke');
+    activeStrokeIdRef.current = id;
+    const point = mapAbsoluteToCanvas(absoluteX, absoluteY);
+    setStrokes((prev) => [...prev, { id, mode, points: [point] }]);
+    resetExtraction();
+    setScrollLocked(true);
+    // Refresh in background for subsequent points / next stroke.
+    refreshCanvasWindow();
+  };
+
+  const endStroke = () => {
+    const id = activeStrokeIdRef.current;
+    activeStrokeIdRef.current = null;
+    setScrollLocked(false);
+    // Drop accidental taps that never became a real underline/circle.
+    if (id) {
+      setStrokes((prev) =>
+        prev.filter((stroke) => !(stroke.id === id && stroke.points.length < 2)),
+      );
+    }
+  };
+
+  const drawPan = Gesture.Pan()
+    .maxPointers(1)
+    .minDistance(2)
+    .averageTouches(false)
+    .onBegin((e) => {
+      beginStroke(e.absoluteX, e.absoluteY);
+    })
+    .onUpdate((e) => {
+      const id = activeStrokeIdRef.current;
+      if (!id) return;
+      transformRef.current = {
+        scale: scaleSV.value,
+        tx: txSV.value,
+        ty: tySV.value,
+      };
+      appendPoint(id, mapAbsoluteToCanvas(e.absoluteX, e.absoluteY));
+    })
+    .onEnd(() => {
+      endStroke();
+    })
+    .onFinalize(() => {
+      if (activeStrokeIdRef.current) endStroke();
     })
     .runOnJS(true);
 
+  // Pinch / two-finger pan take priority so zoom doesn't create stray draw strokes.
+  const canvasGesture = Gesture.Exclusive(
+    Gesture.Simultaneous(pinch, twoFingerPan),
+    drawPan,
+  );
+
+  const canvasAnimatedStyle = useAnimatedStyle(() => {
+    const cx = PAGE_WIDTH / 2;
+    const cy = PAGE_HEIGHT / 2;
+    return {
+      transform: [
+        { translateX: cx + txSV.value },
+        { translateY: cy + tySV.value },
+        { scale: scaleSV.value },
+        { translateX: -cx },
+        { translateY: -cy },
+      ],
+    };
+  });
+
   const selectedCount = items.filter((i) => i.selected && i.status === 'ok').length;
+  const canUndo = strokes.length > 0;
 
   const onSaveSelected = async () => {
     if (!selectedSourceId || saving) return;
@@ -304,15 +586,6 @@ export default function CaptureScreen() {
   };
 
   const selectedSource = sources.find((s) => s.id === selectedSourceId);
-  const cropPreview = useMemo(() => {
-    if (!bounds || !imageSize) return null;
-    return viewBoundsToImageCrop(
-      bounds,
-      { width: PAGE_WIDTH, height: PAGE_HEIGHT },
-      imageSize,
-      mode,
-    );
-  }, [bounds, imageSize, mode]);
 
   return (
     <KeyboardAvoidingView
@@ -326,7 +599,9 @@ export default function CaptureScreen() {
         <Text style={styles.topTitle}>Look up</Text>
         <Pressable
           onPress={() => {
-            setStroke([]);
+            setStrokes([]);
+            activeStrokeIdRef.current = null;
+            resetZoom();
             resetExtraction();
           }}
           hitSlop={10}
@@ -335,7 +610,15 @@ export default function CaptureScreen() {
         </Pressable>
       </View>
 
-      <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
+      <ScrollView
+        contentContainerStyle={styles.content}
+        keyboardShouldPersistTaps="handled"
+        scrollEnabled={!scrollLocked}
+        scrollEventThrottle={16}
+        onScroll={refreshCanvasWindow}
+        onMomentumScrollEnd={refreshCanvasWindow}
+        onScrollEndDrag={refreshCanvasWindow}
+      >
         {!imageUri ? (
           <View style={styles.emptyCapture}>
             <Pressable
@@ -384,86 +667,112 @@ export default function CaptureScreen() {
                 <Pressable
                   key={m}
                   style={[styles.modeChip, mode === m && styles.modeActive]}
-                  onPress={() => {
-                    setMode(m);
-                    setStroke([]);
-                    resetExtraction();
-                  }}
+                  onPress={() => setMode(m)}
                 >
                   <Text style={[styles.modeText, mode === m && styles.modeTextActive]}>
                     {m === 'underline' ? 'Underline' : 'Circle'}
                   </Text>
                 </Pressable>
               ))}
+              <View style={styles.modeSpacer} />
+              <Pressable
+                style={[styles.modeChip, !canUndo && styles.disabled]}
+                onPress={undoLastStroke}
+                disabled={!canUndo}
+              >
+                <Ionicons
+                  name="arrow-undo"
+                  size={16}
+                  color={!canUndo ? colors.textTertiary : colors.text}
+                />
+                <Text
+                  style={[styles.modeText, !canUndo && { color: colors.textTertiary }]}
+                >
+                  Undo
+                </Text>
+              </Pressable>
+              <Pressable style={styles.modeChip} onPress={resetZoom}>
+                <Ionicons name="scan-outline" size={16} color={colors.text} />
+                <Text style={styles.modeText}>Reset zoom</Text>
+              </Pressable>
             </View>
 
-            <GestureDetector gesture={pan}>
-              <View style={[styles.canvas, { width: PAGE_WIDTH, height: PAGE_HEIGHT }]}>
-                <Image source={{ uri: imageUri }} style={styles.page} contentFit="contain" />
-                <Svg style={StyleSheet.absoluteFill}>
-                  {path ? (
-                    <Path
-                      d={path}
-                      stroke={colors.link}
-                      strokeWidth={mode === 'underline' ? 3 : 2.5}
-                      fill="none"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    />
-                  ) : null}
-                  {bounds ? (
-                    <Rect
-                      x={bounds.minX}
-                      y={
-                        mode === 'underline'
-                          ? bounds.minY - Math.max(36, (bounds.maxY - bounds.minY) * 5)
-                          : bounds.minY - 10
-                      }
-                      width={Math.max(1, bounds.maxX - bounds.minX + (mode === 'underline' ? 24 : 20))}
-                      height={
-                        mode === 'underline'
-                          ? Math.max(36, (bounds.maxY - bounds.minY) * 5) +
-                            (bounds.maxY - bounds.minY) * 1.5
-                          : bounds.maxY - bounds.minY + 20
-                      }
-                      stroke="rgba(0,122,255,0.45)"
-                      strokeWidth={1}
-                      fill="rgba(0,122,255,0.08)"
-                    />
-                  ) : null}
-                </Svg>
+            <GestureDetector gesture={canvasGesture}>
+              <View
+                ref={canvasNodeRef}
+                collapsable={false}
+                style={[styles.canvas, { width: PAGE_WIDTH, height: PAGE_HEIGHT }]}
+                onLayout={() => {
+                  canvasNodeRef.current?.measureInWindow((x, y) => {
+                    canvasWindowRef.current = { x, y };
+                  });
+                }}
+              >
+                <Animated.View
+                  style={[
+                    { width: PAGE_WIDTH, height: PAGE_HEIGHT },
+                    canvasAnimatedStyle,
+                  ]}
+                >
+                  <Image source={{ uri: imageUri }} style={styles.page} contentFit="contain" />
+                  <Svg style={StyleSheet.absoluteFill} pointerEvents="none">
+                    {strokes.map((stroke) => {
+                      const d = pointsToPath(stroke.points);
+                      if (!d) return null;
+                      return (
+                        <Path
+                          key={stroke.id}
+                          d={d}
+                          stroke={colors.link}
+                          strokeWidth={stroke.mode === 'underline' ? 3 : 2.5}
+                          fill="none"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        />
+                      );
+                    })}
+                  </Svg>
+                </Animated.View>
               </View>
             </GestureDetector>
 
             <Text style={styles.hint}>
-              {mode === 'underline'
-                ? 'Draw under the word(s). We’ll read the text just above your line.'
-                : 'Circle the word(s). We’ll read everything inside the mark.'}
+              Pinch to zoom, two fingers to pan, one finger to draw. Undo removes your last
+              underline or circle. Extraction uses Gemini AI (not on-device OCR).
             </Text>
+
+            <Pressable
+              style={[styles.secondaryBtn, extracting && styles.disabled]}
+              onPress={() => void extractPenUnderlines()}
+              disabled={extracting}
+            >
+              {extracting ? (
+                <ActivityIndicator color={colors.text} />
+              ) : (
+                <Ionicons name="color-wand-outline" size={18} color={colors.text} />
+              )}
+              <Text style={styles.secondaryText}>
+                {extracting ? 'Gemini is reading marks…' : 'Extract pen marks (AI)'}
+              </Text>
+            </Pressable>
 
             <Pressable
               style={[
                 styles.primaryBtn,
-                (extracting || stroke.length < 2) && styles.disabled,
+                (extracting || finishedStrokes.length === 0) && styles.disabled,
               ]}
               onPress={() => void extractFromStroke()}
-              disabled={extracting || stroke.length < 2}
+              disabled={extracting || finishedStrokes.length === 0}
             >
               {extracting ? (
                 <ActivityIndicator color="#fff" />
               ) : (
-                <Ionicons name="scan" size={18} color="#fff" />
+                <Ionicons name="color-wand" size={18} color="#fff" />
               )}
               <Text style={styles.primaryText}>
-                {extracting ? 'Reading marked words…' : 'Extract & look up'}
+                {extracting ? 'Gemini is reading…' : 'Extract drawn marks (AI)'}
               </Text>
             </Pressable>
-
-            {cropPreview ? (
-              <Text style={styles.debug}>
-                Region {cropPreview.width}×{cropPreview.height}px
-              </Text>
-            ) : null}
 
             {items.length > 0 ? (
               <View style={styles.listCard}>
@@ -481,7 +790,7 @@ export default function CaptureScreen() {
                     style={styles.itemRow}
                     onPress={() =>
                       setItems((prev) =>
-                        prev.map((row) =>
+                        prev.map((row) => 
                           row.word === item.word
                             ? { ...row, selected: !row.selected }
                             : row,
@@ -633,12 +942,22 @@ const styles = StyleSheet.create({
     backgroundColor: colors.surface,
   },
   secondaryText: { color: colors.text, fontSize: 16, fontWeight: '600' },
-  modeRow: { flexDirection: 'row', gap: 8, marginBottom: 12 },
+  modeRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 12,
+  },
+  modeSpacer: { flexGrow: 1, minWidth: 8 },
   modeChip: {
     backgroundColor: colors.surface,
     paddingHorizontal: 14,
     paddingVertical: 8,
     borderRadius: 16,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
   },
   modeActive: { backgroundColor: colors.text },
   modeText: { fontSize: 14, color: colors.text, fontWeight: '600' },
