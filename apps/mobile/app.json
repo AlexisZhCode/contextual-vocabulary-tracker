@@ -56,7 +56,8 @@
       "expo-document-picker"
     ],
     "experiments": {
-      "typedRoutes": true
+      "typedRoutes": true,
+      "baseUrl": "/contextual-vocabulary-tracker"
     }
   }
 }
