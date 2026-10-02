@@ -29,7 +29,7 @@ jobs:
       - name: Install and export web
         working-directory: apps/mobile
         run: |
-          npm ci
+          npm ci --legacy-peer-deps
           npx expo export --platform web
 
       - uses: actions/configure-pages@v5
