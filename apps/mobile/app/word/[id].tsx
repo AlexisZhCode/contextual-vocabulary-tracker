@@ -2,6 +2,8 @@ import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useEffect, useState } from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
 
+import { fetchWordPronunciationMeta } from '../../src/api/dictionary';
+import { PhoneticLabel } from '../../src/components/PhoneticLabel';
 import { PronounceButton } from '../../src/components/PronounceButton';
 import { ScreenHeader } from '../../src/components/ScreenHeader';
 import * as queries from '../../src/db/queries';
@@ -18,7 +20,27 @@ export default function WordDetailScreen() {
     if (!id) return;
     void queries
       .getEntry(id)
-      .then(setEntry)
+      .then(async (row) => {
+        setEntry(row);
+        if (!row || (row.phonetic && row.audioUrl)) return;
+        const meta = await fetchWordPronunciationMeta(row.word).catch(() => null);
+        if (!meta) return;
+        if (meta.phonetic && !row.phonetic) {
+          await queries.updateEntryPhonetic(row.id, meta.phonetic);
+        }
+        if (meta.audioUrl && !row.audioUrl) {
+          await queries.updateEntryAudio(row.id, meta.audioUrl);
+        }
+        setEntry((prev) =>
+          prev
+            ? {
+                ...prev,
+                phonetic: prev.phonetic || meta.phonetic,
+                audioUrl: prev.audioUrl || meta.audioUrl,
+              }
+            : prev,
+        );
+      })
       .finally(() => setLoading(false));
   }, [id]);
 
@@ -62,7 +84,7 @@ export default function WordDetailScreen() {
             }}
           />
         </View>
-        {entry.phonetic ? <Text style={styles.phonetic}>/{entry.phonetic}/</Text> : null}
+        <PhoneticLabel phonetic={entry.phonetic} style={styles.phonetic} />
         {entry.pos ? <Text style={styles.pos}>{entry.pos}</Text> : null}
         <Text style={styles.glossZh}>{entry.glossZh}</Text>
         {entry.glossEn ? <Text style={styles.glossEn}>{entry.glossEn}</Text> : null}
@@ -94,7 +116,7 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     alignItems: 'center',
   },
-  word: { fontSize: 32, fontWeight: '800', textTransform: 'capitalize', flex: 1 },
+  word: { fontSize: 32, fontWeight: '800', flex: 1 },
   phonetic: { color: colors.textSecondary, fontSize: 16 },
   pos: { color: colors.textTertiary, fontStyle: 'italic' },
   glossZh: { marginTop: 10, fontSize: 18, lineHeight: 26 },

@@ -294,6 +294,52 @@ export async function deleteSource(id: string): Promise<void> {
   await db.runAsync(`DELETE FROM sources WHERE id = ?`, [id]);
 }
 
+function normalizeEntryWord(word: string) {
+  return word.trim().toLowerCase();
+}
+
+function displayEntryWord(word: string) {
+  return word.trim();
+}
+
+/** Words already saved for a source (case-insensitive). */
+export async function findExistingWordsForSource(
+  sourceId: string,
+  words: string[],
+): Promise<Set<string>> {
+  const normalized = Array.from(
+    new Set(words.map(normalizeEntryWord).filter(Boolean)),
+  );
+  const existing = new Set<string>();
+  if (!sourceId || !normalized.length) return existing;
+
+  const db = await getDb();
+  // Chunk IN-lists for safety on large extract batches.
+  const chunkSize = 80;
+  for (let i = 0; i < normalized.length; i += chunkSize) {
+    const chunk = normalized.slice(i, i + chunkSize);
+    const placeholders = chunk.map(() => '?').join(', ');
+    const rows = await db.getAllAsync<{ word: string }>(
+      `SELECT DISTINCT lower(word) AS word
+       FROM entries
+       WHERE source_id = ? AND lower(word) IN (${placeholders})`,
+      [sourceId, ...chunk],
+    );
+    for (const row of rows) {
+      if (row.word) existing.add(row.word);
+    }
+  }
+  return existing;
+}
+
+export async function entryExistsForSource(
+  sourceId: string,
+  word: string,
+): Promise<boolean> {
+  const existing = await findExistingWordsForSource(sourceId, [word]);
+  return existing.has(normalizeEntryWord(word));
+}
+
 export async function createEntry(input: {
   id: string;
   sourceId: string;
@@ -306,8 +352,16 @@ export async function createEntry(input: {
   sentence?: string | null;
   chapter?: string | null;
   chapterId?: string | null;
-}): Promise<void> {
+}): Promise<'created' | 'duplicate'> {
   const db = await getDb();
+  const word = displayEntryWord(input.word);
+  if (!word) return 'duplicate';
+
+  // Dedupe is case-insensitive; stored spelling keeps original casing (e.g. proper nouns).
+  if (await entryExistsForSource(input.sourceId, word)) {
+    return 'duplicate';
+  }
+
   const now = new Date().toISOString();
   await db.runAsync(
     `INSERT INTO entries
@@ -316,7 +370,7 @@ export async function createEntry(input: {
     [
       input.id,
       input.sourceId,
-      input.word.trim().toLowerCase(),
+      word,
       input.phonetic ?? null,
       input.pos ?? null,
       input.glossZh,
@@ -333,6 +387,7 @@ export async function createEntry(input: {
     `UPDATE sources SET last_captured_at = ?, status = CASE WHEN status = 'toRead' THEN 'readingNow' ELSE status END WHERE id = ?`,
     [now, input.sourceId],
   );
+  return 'created';
 }
 
 export async function getEntry(id: string): Promise<Entry | null> {
@@ -344,6 +399,11 @@ export async function getEntry(id: string): Promise<Entry | null> {
 export async function updateEntryAudio(id: string, audioUrl: string): Promise<void> {
   const db = await getDb();
   await db.runAsync(`UPDATE entries SET audio_url = ? WHERE id = ?`, [audioUrl, id]);
+}
+
+export async function updateEntryPhonetic(id: string, phonetic: string): Promise<void> {
+  const db = await getDb();
+  await db.runAsync(`UPDATE entries SET phonetic = ? WHERE id = ?`, [phonetic, id]);
 }
 
 export async function markEntryReviewed(id: string, nextDueAt: string): Promise<void> {
@@ -466,7 +526,7 @@ export async function replaceChaptersForSource(
         [
           w.id,
           sourceId,
-          w.word.trim().toLowerCase(),
+          displayEntryWord(w.word),
           w.phonetic ?? null,
           w.pos ?? null,
           w.glossZh,

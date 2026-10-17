@@ -79,7 +79,6 @@ const styles = StyleSheet.create({
     fontSize: 22,
     fontWeight: '700',
     color: colors.text,
-    textTransform: 'capitalize',
   },
   gloss: {
     marginTop: 6,

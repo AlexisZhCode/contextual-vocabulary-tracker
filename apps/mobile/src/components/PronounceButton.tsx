@@ -1,9 +1,8 @@
 import { Ionicons } from '@expo/vector-icons';
-import { createAudioPlayer } from 'expo-audio';
-import { useState } from 'react';
-import { ActivityIndicator, Pressable, StyleSheet } from 'react-native';
+import { useEffect, useState } from 'react';
+import { ActivityIndicator, Pressable, StyleSheet, type GestureResponderEvent } from 'react-native';
 
-import { fetchWordAudio } from '../api/dictionary';
+import { playWordPronunciation } from '../api/pronounce';
 import { colors } from '../theme/colors';
 
 type Props = {
@@ -17,31 +16,31 @@ export function PronounceButton({ word, audioUrl, size = 22, onResolved }: Props
   const [loading, setLoading] = useState(false);
   const [url, setUrl] = useState(audioUrl ?? null);
 
-  const play = async () => {
+  useEffect(() => {
+    setUrl(audioUrl ?? null);
+  }, [audioUrl, word]);
+
+  const play = async (event?: GestureResponderEvent) => {
+    event?.stopPropagation?.();
     if (loading) return;
-    let next = url;
-    if (!next) {
-      setLoading(true);
-      try {
-        next = await fetchWordAudio(word);
-        if (next) {
-          setUrl(next);
-          onResolved?.(next);
-        }
-      } finally {
-        setLoading(false);
+    setLoading(true);
+    try {
+      const resolved = await playWordPronunciation(word, url);
+      if (resolved && resolved !== url) {
+        setUrl(resolved);
+        onResolved?.(resolved);
       }
+    } finally {
+      setLoading(false);
     }
-    if (!next) return;
-    const player = createAudioPlayer(next);
-    player.play();
   };
 
   return (
     <Pressable
-      onPress={() => void play()}
+      onPress={(event) => void play(event)}
       hitSlop={10}
       style={styles.btn}
+      accessibilityRole="button"
       accessibilityLabel={`Pronounce ${word}`}
     >
       {loading ? (

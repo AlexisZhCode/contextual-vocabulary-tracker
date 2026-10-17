@@ -1,5 +1,4 @@
 import { Ionicons } from '@expo/vector-icons';
-import { createAudioPlayer } from 'expo-audio';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useEffect, useState } from 'react';
 import {
@@ -18,6 +17,8 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { lookupWord } from '../src/api/dictionary';
+import { PhoneticLabel } from '../src/components/PhoneticLabel';
+import { PronounceButton } from '../src/components/PronounceButton';
 import * as queries from '../src/db/queries';
 import { colors, radii } from '../src/theme/colors';
 import type { DictionaryResult, SourceWithStats } from '../src/types';
@@ -94,9 +95,8 @@ export default function TypeLookupScreen() {
     if (!result || !selectedSourceId || saving) return;
     setSaving(true);
     try {
-      const id = createId('ent');
-      await queries.createEntry({
-        id,
+      const outcome = await queries.createEntry({
+        id: createId('ent'),
         sourceId: selectedSourceId,
         word: result.word,
         phonetic: result.phonetic,
@@ -105,16 +105,17 @@ export default function TypeLookupScreen() {
         glossEn: result.glossEn,
         audioUrl: result.audioUrl,
       });
+      if (outcome === 'duplicate') {
+        Alert.alert(
+          'Already saved',
+          `“${result.word}” is already in this book.`,
+        );
+        return;
+      }
       router.replace(`/source/${selectedSourceId}`);
     } finally {
       setSaving(false);
     }
-  };
-
-  const playAudio = () => {
-    if (!result?.audioUrl) return;
-    const player = createAudioPlayer(result.audioUrl);
-    player.play();
   };
 
   const selectedSource = sources.find((s) => s.id === selectedSourceId);
@@ -170,15 +171,16 @@ export default function TypeLookupScreen() {
           <View style={styles.result}>
             <View style={styles.resultHeader}>
               <Text style={styles.resultWord}>{result.word}</Text>
-              {result.audioUrl ? (
-                <Pressable onPress={playAudio}>
-                  <Ionicons name="volume-high-outline" size={24} color={colors.link} />
-                </Pressable>
-              ) : null}
+              <PronounceButton
+                word={result.word}
+                audioUrl={result.audioUrl}
+                size={24}
+                onResolved={(audioUrl) =>
+                  setResult((prev) => (prev ? { ...prev, audioUrl } : prev))
+                }
+              />
             </View>
-            {result.phonetic ? (
-              <Text style={styles.phonetic}>/{result.phonetic}/</Text>
-            ) : null}
+            <PhoneticLabel phonetic={result.phonetic} style={styles.phonetic} />
             {result.pos ? <Text style={styles.pos}>{result.pos}</Text> : null}
             <Text style={styles.glossZh}>{result.glossZh}</Text>
             {result.glossEn ? <Text style={styles.glossEn}>{result.glossEn}</Text> : null}
@@ -299,7 +301,6 @@ const styles = StyleSheet.create({
   resultWord: {
     fontSize: 28,
     fontWeight: '800',
-    textTransform: 'capitalize',
   },
   phonetic: { color: colors.textSecondary, fontSize: 15 },
   pos: { color: colors.textTertiary, fontSize: 13, fontStyle: 'italic' },

@@ -13,6 +13,7 @@ import {
 } from 'react-native';
 
 import { prepareBookChapters } from '../../src/api/booksAi';
+import { PhoneticLabel } from '../../src/components/PhoneticLabel';
 import { PronounceButton } from '../../src/components/PronounceButton';
 import { ScreenHeader } from '../../src/components/ScreenHeader';
 import * as queries from '../../src/db/queries';
@@ -315,10 +316,8 @@ export default function SourceDetailScreen() {
               <View style={styles.wordMeta}>
                 <View style={styles.wordTitleRow}>
                   <Text style={styles.word}>{entry.word}</Text>
-                  {entry.phonetic ? (
-                    <Text style={styles.phonetic}>/{entry.phonetic}/</Text>
-                  ) : null}
                 </View>
+                <PhoneticLabel phonetic={entry.phonetic} style={styles.phonetic} />
                 <Text style={styles.gloss} numberOfLines={2}>
                   {entry.glossZh}
                 </Text>
@@ -506,7 +505,7 @@ const styles = StyleSheet.create({
   },
   wordMeta: { flex: 1 },
   wordTitleRow: { flexDirection: 'row', alignItems: 'baseline', flexWrap: 'wrap', gap: 8 },
-  word: { fontSize: 17, fontWeight: '700', color: colors.text, textTransform: 'capitalize' },
+  word: { fontSize: 17, fontWeight: '700', color: colors.text },
   phonetic: { fontSize: 13, color: colors.textTertiary },
   gloss: { marginTop: 4, fontSize: 14, color: colors.textSecondary },
   context: { marginTop: 5, fontSize: 13, lineHeight: 18, color: colors.textTertiary },

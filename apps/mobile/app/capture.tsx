@@ -30,7 +30,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Svg, { Path } from 'react-native-svg';
 
 import { resolveApiBase } from '../src/api/config';
-import { defineBatch, fetchWordAudio } from '../src/api/dictionary';
+import { defineBatch, fetchWordPronunciationMeta } from '../src/api/dictionary';
 import {
   cropUriToJpegBase64,
   extractMarkedText,
@@ -38,6 +38,7 @@ import {
   imageUriToJpegBase64,
   type MarkedTextItem,
 } from '../src/api/geminiExtract';
+import { PhoneticLabel } from '../src/components/PhoneticLabel';
 import { PronounceButton } from '../src/components/PronounceButton';
 import {
   boundsFromPoints,
@@ -61,6 +62,7 @@ type ExtractedItem = DictionaryResult & {
   selected: boolean;
   status: 'ok' | 'missing';
   sentence: string | null;
+  duplicate: boolean;
 };
 
 function createId(prefix: string) {
@@ -127,6 +129,43 @@ export default function CaptureScreen() {
     if (!base) return;
     void fetch(`${base}/health`).catch(() => undefined);
   }, []);
+
+  const markDuplicatesForSource = useCallback(
+    async (sourceId: string | undefined, list: ExtractedItem[]) => {
+      if (!list.length) return list;
+      if (!sourceId) {
+        return list.map((item) => ({ ...item, duplicate: false }));
+      }
+      const existing = await queries.findExistingWordsForSource(
+        sourceId,
+        list.map((item) => item.word),
+      );
+      return list.map((item) => {
+        const duplicate = existing.has(item.word.trim().toLowerCase());
+        return {
+          ...item,
+          duplicate,
+          // Duplicates stay unchecked; new words keep their current selection.
+          selected: duplicate ? false : item.selected,
+        };
+      });
+    },
+    [],
+  );
+
+  // Re-check duplicates when the save target book changes.
+  useEffect(() => {
+    if (!items.length) return;
+    let cancelled = false;
+    void markDuplicatesForSource(selectedSourceId, items).then((next) => {
+      if (!cancelled) setItems(next);
+    });
+    return () => {
+      cancelled = true;
+    };
+    // Only re-run when the source changes, not on every items edit.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedSourceId, markDuplicatesForSource]);
 
   const resetExtraction = () => {
     setItems([]);
@@ -287,7 +326,8 @@ export default function CaptureScreen() {
       const hasDefinition = Boolean(glossZh || glossEn);
       const sentence = item.context?.trim() || null;
       return {
-        word: found?.word ?? item.marked_text,
+        // Keep Gemini/page casing (e.g. proper nouns). Don't force ECDICT lowercase.
+        word: item.marked_text.trim() || found?.word || item.marked_text,
         phonetic: item.phonetic || found?.phonetic || null,
         pos: item.pos ?? found?.pos ?? null,
         glossZh: glossZh || '（未找到释义）',
@@ -297,29 +337,43 @@ export default function CaptureScreen() {
         // Always check found words — missing ECDICT gloss must not block save.
         selected: true,
         status: hasDefinition ? 'ok' : 'missing',
+        duplicate: false,
       };
     });
-    setItems(lookedUp);
+    const withDupes = await markDuplicatesForSource(selectedSourceId, lookedUp);
+    setItems(withDupes);
 
-    // Fill pronunciation audio in the background so extract stays fast.
+    // Fill 音标 + audio in the background so extract stays fast.
     void (async () => {
-      const withAudio = await Promise.all(
-        lookedUp.map(async (item) => {
-          if (item.audioUrl) return item;
-          const audioUrl = await fetchWordAudio(item.word).catch(() => null);
-          return audioUrl ? { ...item, audioUrl } : item;
+      const enriched = await Promise.all(
+        withDupes.map(async (item) => {
+          if (item.phonetic && item.audioUrl) return item;
+          const meta = await fetchWordPronunciationMeta(item.word).catch(() => ({
+            phonetic: null,
+            audioUrl: null,
+          }));
+          return {
+            ...item,
+            phonetic: item.phonetic || meta.phonetic,
+            audioUrl: item.audioUrl || meta.audioUrl,
+          };
         }),
       );
       setItems((prev) => {
         if (!prev.length) return prev;
-        const byWord = new Map(withAudio.map((row) => [row.word, row]));
+        const byWord = new Map(enriched.map((row) => [row.word, row]));
         return prev.map((row) => {
           const next = byWord.get(row.word);
-          return next?.audioUrl ? { ...row, audioUrl: next.audioUrl } : row;
+          if (!next) return row;
+          return {
+            ...row,
+            phonetic: row.phonetic || next.phonetic,
+            audioUrl: row.audioUrl || next.audioUrl,
+          };
         });
       });
     })();
-  }, []);
+  }, [markDuplicatesForSource, selectedSourceId]);
 
   const extractFromStroke = useCallback(async () => {
     if (!imageUri || !imageSize || finishedStrokes.length === 0) {
@@ -587,20 +641,27 @@ export default function CaptureScreen() {
     };
   });
 
-  const selectedCount = items.filter((i) => i.selected).length;
+  const selectedCount = items.filter((i) => i.selected && !i.duplicate).length;
   const canUndo = strokes.length > 0;
 
   const onSaveSelected = async () => {
     if (!selectedSourceId || saving) return;
-    const toSave = items.filter((i) => i.selected);
+    const toSave = items.filter((i) => i.selected && !i.duplicate);
     if (toSave.length === 0) {
-      Alert.alert('Nothing to save', 'Select at least one word.');
+      Alert.alert(
+        'Nothing to save',
+        items.some((i) => i.duplicate)
+          ? 'Selected words are already saved to this book.'
+          : 'Select at least one word.',
+      );
       return;
     }
     setSaving(true);
     try {
+      let created = 0;
+      let skipped = 0;
       for (const item of toSave) {
-        await queries.createEntry({
+        const result = await queries.createEntry({
           id: createId('ent'),
           sourceId: selectedSourceId,
           word: item.word,
@@ -611,6 +672,20 @@ export default function CaptureScreen() {
           audioUrl: item.audioUrl,
           sentence: item.sentence,
         });
+        if (result === 'created') created += 1;
+        else skipped += 1;
+      }
+      if (created === 0) {
+        Alert.alert('Already saved', 'Those words are already in this book.');
+        const refreshed = await markDuplicatesForSource(selectedSourceId, items);
+        setItems(refreshed);
+        return;
+      }
+      if (skipped > 0) {
+        Alert.alert(
+          'Saved',
+          `Saved ${created} new word${created === 1 ? '' : 's'}. Skipped ${skipped} duplicate${skipped === 1 ? '' : 's'}.`,
+        );
       }
       router.replace(`/source/${selectedSourceId}`);
     } finally {
@@ -820,29 +895,50 @@ export default function CaptureScreen() {
                 {items.map((item) => (
                   <Pressable
                     key={item.word}
-                    style={styles.itemRow}
-                    onPress={() =>
+                    style={[styles.itemRow, item.duplicate && styles.itemRowDuplicate]}
+                    onPress={() => {
+                      if (item.duplicate) return;
                       setItems((prev) =>
-                        prev.map((row) => 
+                        prev.map((row) =>
                           row.word === item.word
                             ? { ...row, selected: !row.selected }
                             : row,
                         ),
-                      )
-                    }
+                      );
+                    }}
                   >
                     <Ionicons
-                      name={item.selected ? 'checkbox' : 'square-outline'}
+                      name={
+                        item.duplicate
+                          ? 'remove-circle-outline'
+                          : item.selected
+                            ? 'checkbox'
+                            : 'square-outline'
+                      }
                       size={22}
-                      color={item.selected ? colors.link : colors.textTertiary}
+                      color={
+                        item.duplicate
+                          ? colors.textTertiary
+                          : item.selected
+                            ? colors.link
+                            : colors.textTertiary
+                      }
                     />
                     <View style={styles.itemBody}>
                       <View style={styles.itemTitleRow}>
-                        <Text style={styles.itemWord}>{item.word}</Text>
-                        {item.phonetic ? (
-                          <Text style={styles.itemPhonetic}>/{item.phonetic}/</Text>
-                        ) : null}
+                        <Text
+                          style={[
+                            styles.itemWord,
+                            item.duplicate && styles.itemWordDuplicate,
+                          ]}
+                        >
+                          {item.word}
+                        </Text>
                       </View>
+                      <PhoneticLabel phonetic={item.phonetic} style={styles.itemPhonetic} />
+                      {item.duplicate ? (
+                        <Text style={styles.itemDuplicateLabel}>Already saved to this book</Text>
+                      ) : null}
                       <Text style={styles.itemGloss} numberOfLines={2}>
                         {item.glossZh}
                       </Text>
@@ -1059,6 +1155,7 @@ const styles = StyleSheet.create({
     borderTopColor: colors.separatorLight,
   },
   itemBody: { flex: 1 },
+  itemRowDuplicate: { opacity: 0.55 },
   itemTitleRow: {
     flexDirection: 'row',
     alignItems: 'baseline',
@@ -1066,6 +1163,12 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   itemPhonetic: { fontSize: 13, color: colors.textTertiary },
+  itemDuplicateLabel: {
+    marginTop: 2,
+    fontSize: 12,
+    fontWeight: '600',
+    color: colors.textTertiary,
+  },
   itemSentence: {
     marginTop: 4,
     fontSize: 12,
@@ -1073,10 +1176,10 @@ const styles = StyleSheet.create({
     color: colors.textTertiary,
     fontStyle: 'italic',
   },
+  itemWordDuplicate: { color: colors.textSecondary },
   itemWord: {
     fontSize: 17,
     fontWeight: '700',
-    textTransform: 'capitalize',
   },
   itemGloss: { marginTop: 2, fontSize: 14, color: colors.text, lineHeight: 20 },
   itemEn: { marginTop: 2, fontSize: 12, color: colors.textSecondary, lineHeight: 17 },

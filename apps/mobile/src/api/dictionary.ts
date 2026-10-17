@@ -55,26 +55,64 @@ async function fetchRemoteEcdict(word: string): Promise<DictionaryResult | null>
   }
 }
 
+function cleanPhonetic(value?: string | null): string | null {
+  if (!value) return null;
+  const inner = String(value).replace(/^\/+|\/+$/g, '').trim();
+  return inner || null;
+}
+
 /** Pronunciation audio URL for a word (Free Dictionary via API, with direct fallback). */
 export async function fetchWordAudio(rawWord: string): Promise<string | null> {
+  const meta = await fetchWordPronunciationMeta(rawWord);
+  return meta.audioUrl;
+}
+
+/** IPA/音标 + audio for a word (ECDICT define, then Free Dictionary). */
+export async function fetchWordPronunciationMeta(rawWord: string): Promise<{
+  phonetic: string | null;
+  audioUrl: string | null;
+}> {
   const word = normalizeWord(rawWord);
-  if (!word) return null;
+  if (!word) return { phonetic: null, audioUrl: null };
 
   const base = resolveApiBase();
+  let phonetic: string | null = null;
+  let audioUrl: string | null = null;
+
   if (base) {
     try {
-      const data = (await withTimeout(
-        fetchJson(`${base}/v1/audio/${encodeURIComponent(word)}`),
+      const defined = (await withTimeout(
+        fetchJson(`${base}/v1/define/${encodeURIComponent(word)}`),
         4000,
-      )) as { audioUrl?: string | null } | null;
-      if (data?.audioUrl) return data.audioUrl;
+      )) as DictionaryResult | null;
+      phonetic = cleanPhonetic(defined?.phonetic);
+      audioUrl = defined?.audioUrl ?? null;
     } catch {
       // fall through
     }
   }
 
-  const free = await withTimeout(fetchFreeDictionary(word), 4000);
-  return free?.audioUrl ?? null;
+  if (!audioUrl) {
+    try {
+      const data = base
+        ? ((await withTimeout(
+            fetchJson(`${base}/v1/audio/${encodeURIComponent(word)}`),
+            4000,
+          )) as { audioUrl?: string | null } | null)
+        : null;
+      if (data?.audioUrl) audioUrl = data.audioUrl;
+    } catch {
+      // fall through
+    }
+  }
+
+  if (!phonetic || !audioUrl) {
+    const free = await withTimeout(fetchFreeDictionary(word), 4000);
+    phonetic = phonetic || cleanPhonetic(free?.phonetic);
+    audioUrl = audioUrl || free?.audioUrl || null;
+  }
+
+  return { phonetic, audioUrl };
 }
 
 /** Local ECDICT batch lookup via the API (no public dictionary fan-out). */

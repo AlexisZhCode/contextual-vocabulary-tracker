@@ -13,6 +13,7 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { ConfettiBurst } from '../../../../src/components/ConfettiBurst';
+import { PhoneticLabel } from '../../../../src/components/PhoneticLabel';
 import { PronounceButton } from '../../../../src/components/PronounceButton';
 import { ScreenHeader } from '../../../../src/components/ScreenHeader';
 import * as queries from '../../../../src/db/queries';
@@ -156,9 +157,7 @@ export default function ChapterDetailScreen() {
             >
               <View style={{ flex: 1 }}>
                 <Text style={styles.word}>{entry.word}</Text>
-                {entry.phonetic ? (
-                  <Text style={styles.phonetic}>/{entry.phonetic}/</Text>
-                ) : null}
+                <PhoneticLabel phonetic={entry.phonetic} style={styles.phonetic} />
                 <Text style={styles.gloss} numberOfLines={2}>
                   {entry.glossZh}
                 </Text>
@@ -270,7 +269,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 10,
   },
-  word: { fontSize: 17, fontWeight: '700', textTransform: 'capitalize', color: colors.text },
+  word: { fontSize: 17, fontWeight: '700', color: colors.text },
   phonetic: { marginTop: 2, fontSize: 13, color: colors.textTertiary },
   gloss: { marginTop: 4, fontSize: 14, color: colors.textSecondary },
   sentence: {
