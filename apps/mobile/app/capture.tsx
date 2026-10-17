@@ -29,13 +29,16 @@ import Animated, {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Svg, { Path } from 'react-native-svg';
 
-import { lookupWord } from '../src/api/dictionary';
+import { resolveApiBase } from '../src/api/config';
+import { defineBatch, fetchWordAudio } from '../src/api/dictionary';
 import {
   cropUriToJpegBase64,
   extractMarkedText,
+  extractMarkedTextBatch,
   imageUriToJpegBase64,
   type MarkedTextItem,
 } from '../src/api/geminiExtract';
+import { PronounceButton } from '../src/components/PronounceButton';
 import {
   boundsFromPoints,
   viewBoundsToImageCrop,
@@ -57,6 +60,7 @@ type Stroke = {
 type ExtractedItem = DictionaryResult & {
   selected: boolean;
   status: 'ok' | 'missing';
+  sentence: string | null;
 };
 
 function createId(prefix: string) {
@@ -116,6 +120,13 @@ export default function CaptureScreen() {
       }
     });
   }, [presetSourceId]);
+
+  // Wake a sleeping Render free-tier instance before the user taps Extract.
+  useEffect(() => {
+    const base = resolveApiBase();
+    if (!base) return;
+    void fetch(`${base}/health`).catch(() => undefined);
+  }, []);
 
   const resetExtraction = () => {
     setItems([]);
@@ -253,26 +264,60 @@ export default function CaptureScreen() {
 
     setRawOcr(marked.map((m) => m.marked_text).join(' · '));
 
-    const lookedUp: ExtractedItem[] = [];
+    const unique: MarkedTextItem[] = [];
     const seen = new Set<string>();
     for (const item of marked) {
       const key = item.marked_text.toLowerCase();
       if (seen.has(key)) continue;
       seen.add(key);
+      unique.push(item);
+    }
 
-      const found = await lookupWord(item.marked_text).catch(() => null);
-      lookedUp.push({
+    const needsLookup = unique
+      .filter((item) => !item.definition && !item.glossEn)
+      .map((item) => item.marked_text);
+    const batch = needsLookup.length ? await defineBatch(needsLookup) : {};
+
+    const lookedUp: ExtractedItem[] = unique.map((item) => {
+      const key = item.marked_text.toLowerCase();
+      const firstWord = key.match(/[a-z][a-z'-]*/)?.[0] || key;
+      const found = batch[key] || batch[firstWord] || null;
+      const glossZh = item.definition || found?.glossZh || '';
+      const glossEn = item.glossEn ?? found?.glossEn ?? null;
+      const ok = Boolean(glossZh || glossEn);
+      const sentence = item.context?.trim() || null;
+      return {
         word: found?.word ?? item.marked_text,
         phonetic: item.phonetic || found?.phonetic || null,
-        pos: found?.pos ?? null,
-        glossZh: item.definition || found?.glossZh || '（未找到释义）',
-        glossEn: item.context || found?.glossEn || null,
+        pos: item.pos ?? found?.pos ?? null,
+        glossZh: glossZh || '（未找到释义）',
+        glossEn,
         audioUrl: found?.audioUrl ?? null,
-        selected: Boolean(item.definition || found?.glossZh),
-        status: item.definition || found?.glossZh ? 'ok' : 'missing',
-      });
-    }
+        sentence,
+        selected: ok,
+        status: ok ? 'ok' : 'missing',
+      };
+    });
     setItems(lookedUp);
+
+    // Fill pronunciation audio in the background so extract stays fast.
+    void (async () => {
+      const withAudio = await Promise.all(
+        lookedUp.map(async (item) => {
+          if (item.audioUrl || item.status !== 'ok') return item;
+          const audioUrl = await fetchWordAudio(item.word).catch(() => null);
+          return audioUrl ? { ...item, audioUrl } : item;
+        }),
+      );
+      setItems((prev) => {
+        if (!prev.length) return prev;
+        const byWord = new Map(withAudio.map((row) => [row.word, row]));
+        return prev.map((row) => {
+          const next = byWord.get(row.word);
+          return next?.audioUrl ? { ...row, audioUrl: next.audioUrl } : row;
+        });
+      });
+    })();
   }, []);
 
   const extractFromStroke = useCallback(async () => {
@@ -297,25 +342,11 @@ export default function CaptureScreen() {
         })
         .filter((c): c is NonNullable<typeof c> => !!c);
 
-      // Run Gemini calls in parallel — sequential was the main draw-path bottleneck.
-      const batches = await Promise.all(
-        crops.map(async (crop) => {
-          const base64 = await cropUriToJpegBase64(imageUri, crop);
-          return extractMarkedText(base64, { regionMode: true });
-        }),
+      // One Gemini request for all crops (N parallel calls were the main bottleneck).
+      const base64Crops = await Promise.all(
+        crops.map((crop) => cropUriToJpegBase64(imageUri, crop)),
       );
-
-      const merged: MarkedTextItem[] = [];
-      const seen = new Set<string>();
-      for (const items of batches) {
-        for (const item of items) {
-          const key = item.marked_text.toLowerCase();
-          if (seen.has(key)) continue;
-          seen.add(key);
-          merged.push(item);
-        }
-      }
-
+      const merged = await extractMarkedTextBatch(base64Crops);
       await applyMarkedItems(merged);
     } catch (error) {
       Alert.alert(
@@ -577,6 +608,7 @@ export default function CaptureScreen() {
           glossZh: item.glossZh,
           glossEn: item.glossEn,
           audioUrl: item.audioUrl,
+          sentence: item.sentence,
         });
       }
       router.replace(`/source/${selectedSourceId}`);
@@ -804,7 +836,12 @@ export default function CaptureScreen() {
                       color={item.status === 'ok' ? colors.link : colors.textTertiary}
                     />
                     <View style={styles.itemBody}>
-                      <Text style={styles.itemWord}>{item.word}</Text>
+                      <View style={styles.itemTitleRow}>
+                        <Text style={styles.itemWord}>{item.word}</Text>
+                        {item.phonetic ? (
+                          <Text style={styles.itemPhonetic}>/{item.phonetic}/</Text>
+                        ) : null}
+                      </View>
                       <Text style={styles.itemGloss} numberOfLines={2}>
                         {item.glossZh}
                       </Text>
@@ -813,7 +850,25 @@ export default function CaptureScreen() {
                           {item.glossEn}
                         </Text>
                       ) : null}
+                      {item.sentence ? (
+                        <Text style={styles.itemSentence} numberOfLines={2}>
+                          “{item.sentence}”
+                        </Text>
+                      ) : null}
                     </View>
+                    {item.status === 'ok' ? (
+                      <PronounceButton
+                        word={item.word}
+                        audioUrl={item.audioUrl}
+                        onResolved={(audioUrl) =>
+                          setItems((prev) =>
+                            prev.map((row) =>
+                              row.word === item.word ? { ...row, audioUrl } : row,
+                            ),
+                          )
+                        }
+                      />
+                    ) : null}
                   </Pressable>
                 ))}
 
@@ -1005,6 +1060,20 @@ const styles = StyleSheet.create({
     borderTopColor: colors.separatorLight,
   },
   itemBody: { flex: 1 },
+  itemTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  itemPhonetic: { fontSize: 13, color: colors.textTertiary },
+  itemSentence: {
+    marginTop: 4,
+    fontSize: 12,
+    lineHeight: 17,
+    color: colors.textTertiary,
+    fontStyle: 'italic',
+  },
   itemWord: {
     fontSize: 17,
     fontWeight: '700',

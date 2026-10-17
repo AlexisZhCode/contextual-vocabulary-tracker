@@ -42,6 +42,12 @@ const GEMINI_MODELS = [
   'gemini-3.6-flash',
 ];
 
+const GEMINI_LITE_MODELS = [
+  'gemini-flash-lite-latest',
+  'gemini-3.5-flash-lite',
+  'gemini-3.1-flash-lite',
+];
+
 const RETRYABLE = new Set([429, 503]);
 
 function sleep(ms) {
@@ -56,10 +62,31 @@ function getApiKey() {
   return String(process.env.GEMINI_API_KEY || '').trim();
 }
 
-function buildBody(prompt, model, image) {
+function normalizeImages(options = {}) {
+  if (Array.isArray(options.images) && options.images.length) {
+    return options.images
+      .map((img) => ({
+        data: String(img?.data || '').replace(/\s/g, ''),
+        mimeType: img?.mimeType || 'image/jpeg',
+      }))
+      .filter((img) => img.data);
+  }
+  if (options.image?.data) {
+    return [
+      {
+        data: String(options.image.data).replace(/\s/g, ''),
+        mimeType: options.image.mimeType || 'image/jpeg',
+      },
+    ];
+  }
+  return [];
+}
+
+function buildBody(prompt, model, options = {}) {
+  const maxOutputTokens = Number(options.maxOutputTokens) || 8192;
   const generationConfig = {
-    temperature: 0.2,
-    maxOutputTokens: 8192,
+    temperature: options.temperature ?? 0.2,
+    maxOutputTokens,
     responseMimeType: 'application/json',
   };
   // Lite models reject thinkingConfig (400). Full Flash often needs budget 0 to stay fast.
@@ -67,7 +94,7 @@ function buildBody(prompt, model, image) {
     generationConfig.thinkingConfig = { thinkingBudget: 0 };
   }
   const parts = [{ text: prompt }];
-  if (image?.data) {
+  for (const image of normalizeImages(options)) {
     parts.push({
       inline_data: {
         mime_type: image.mimeType || 'image/jpeg',
@@ -84,7 +111,14 @@ function buildBody(prompt, model, image) {
 /**
  * Call Gemini and parse a JSON response (object or array).
  * @param {string} prompt
- * @param {{ timeoutMs?: number, image?: { data: string, mimeType?: string } }} [options]
+ * @param {{
+ *   timeoutMs?: number,
+ *   image?: { data: string, mimeType?: string },
+ *   images?: Array<{ data: string, mimeType?: string }>,
+ *   liteOnly?: boolean,
+ *   maxOutputTokens?: number,
+ *   temperature?: number,
+ * }} [options]
  */
 export async function geminiJson(prompt, options = {}) {
   const apiKey = getApiKey();
@@ -95,18 +129,19 @@ export async function geminiJson(prompt, options = {}) {
   }
 
   const timeoutMs = options.timeoutMs ?? 90000;
+  const models = options.liteOnly ? GEMINI_LITE_MODELS : GEMINI_MODELS;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     let lastError = 'Gemini request failed.';
-    for (const model of GEMINI_MODELS) {
+    for (const model of models) {
       for (let attempt = 1; attempt <= 2; attempt += 1) {
         const res = await fetch(`${endpoint(model)}?key=${encodeURIComponent(apiKey)}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           signal: controller.signal,
-          body: JSON.stringify(buildBody(prompt, model, options.image)),
+          body: JSON.stringify(buildBody(prompt, model, options)),
         });
 
         if (res.status === 404 || res.status === 400) {

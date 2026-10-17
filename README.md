@@ -38,15 +38,17 @@ On a physical device, use your machine LAN IP instead of `localhost`.
 
 ## Dictionary API (ECDICT)
 
-Full ECDICT (~770k words) is supported.
+Screenshot extract uses Gemini for marked words, then ECDICT for definitions.
 
 ```bash
 cd services/api
 npm install
-# First time only — downloads/builds if ecdict.csv is present:
-npm run build:db
+# Place ecdict.csv in data/ (optional). Trimmed build for deploy:
+ECDICT_TRIM=1 npm run build:db
 npm run dev         # http://localhost:8787
 ```
+
+On Render, set Build Command to `bash scripts/render-build.sh` (see `services/api/README.md`).
 
 Android emulator reaches this API at `http://10.0.2.2:8787` automatically.
 iOS simulator uses `http://localhost:8787`.

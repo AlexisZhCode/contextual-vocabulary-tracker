@@ -7,6 +7,11 @@
  *   2. Place the CSV at services/api/data/ecdict.csv
  *   3. npm run build:db
  *
+ * Trimmed import (recommended for Render):
+ *   ECDICT_TRIM=1 npm run build:db
+ * Keeps rows with a Chinese translation and at least one of:
+ * collins>=1, oxford==1, frq>0, or a non-empty tag.
+ *
  * Without a CSV, writes a small starter DB so /v1/define works offline.
  */
 import Database from 'better-sqlite3';
@@ -18,6 +23,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const dataDir = path.join(__dirname, '..', 'data');
 const csvPath = path.join(dataDir, 'ecdict.csv');
 const outPath = path.join(dataDir, 'ecdict.sqlite');
+const trim = String(process.env.ECDICT_TRIM || '').trim() === '1';
 
 fs.mkdirSync(dataDir, { recursive: true });
 if (fs.existsSync(outPath)) fs.unlinkSync(outPath);
@@ -73,6 +79,22 @@ function parseCsvLine(line) {
   return cells;
 }
 
+function toInt(value) {
+  const n = Number.parseInt(String(value ?? '').trim(), 10);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function shouldKeepRow(cells, idx) {
+  const translation = String(cells[idx.translation] || '').trim();
+  if (!translation) return false;
+  if (!trim) return true;
+  const collins = toInt(cells[idx.collins]);
+  const oxford = toInt(cells[idx.oxford]);
+  const frq = toInt(cells[idx.frq]);
+  const tag = String(cells[idx.tag] || '').trim();
+  return collins >= 1 || oxford === 1 || frq > 0 || Boolean(tag);
+}
+
 const insert = db.prepare(`
   INSERT INTO stardict
     (word, sw, phonetic, definition, translation, pos, collins, oxford, tag, bnc, frq, exchange, detail, audio)
@@ -119,16 +141,21 @@ const tx = db.transaction((rows) => {
 });
 
 if (fs.existsSync(csvPath)) {
-  console.log(`Importing ${csvPath} …`);
+  console.log(`Importing ${csvPath}${trim ? ' (trimmed)' : ''} …`);
   const text = fs.readFileSync(csvPath, 'utf8');
   const lines = text.split(/\r?\n/);
   const header = parseCsvLine(lines[0] || '');
   const idx = Object.fromEntries(header.map((h, i) => [h.trim(), i]));
   let count = 0;
+  let skipped = 0;
   const batch = db.transaction((chunk) => {
     for (const cells of chunk) {
       const word = cells[idx.word] || '';
       if (!word) continue;
+      if (!shouldKeepRow(cells, idx)) {
+        skipped += 1;
+        continue;
+      }
       insert.run(
         word,
         stripWord(word),
@@ -161,7 +188,9 @@ if (fs.existsSync(csvPath)) {
     }
   }
   if (chunk.length) batch(chunk);
-  console.log(`Done. Imported ${count} entries → ${outPath}`);
+  console.log(
+    `Done. Imported ${count} entries${trim ? ` (skipped ${skipped})` : ''} → ${outPath}`,
+  );
 } else {
   tx(starter);
   console.log(`No ecdict.csv found. Wrote starter DB (${starter.length} words) → ${outPath}`);

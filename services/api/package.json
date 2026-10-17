@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "node --watch src/server.js",
     "start": "node src/server.js",
-    "build:db": "node scripts/build-ecdict.js"
+    "build:db": "node scripts/build-ecdict.js",
+    "build:render": "bash scripts/render-build.sh"
   },
   "dependencies": {
     "better-sqlite3": "^11.10.0",

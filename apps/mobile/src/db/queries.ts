@@ -341,6 +341,11 @@ export async function getEntry(id: string): Promise<Entry | null> {
   return row ? mapEntry(row) : null;
 }
 
+export async function updateEntryAudio(id: string, audioUrl: string): Promise<void> {
+  const db = await getDb();
+  await db.runAsync(`UPDATE entries SET audio_url = ? WHERE id = ?`, [audioUrl, id]);
+}
+
 export async function markEntryReviewed(id: string, nextDueAt: string): Promise<void> {
   const db = await getDb();
   await db.runAsync(

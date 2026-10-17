@@ -139,43 +139,100 @@ Find physical marks: underlines, circles, highlights, brackets/boxes.
 For each marked region return JSON objects with:
 - "marked_text": exact marked word/phrase/sentence
 - "context": surrounding sentence
-- "definition": brief Chinese definition
-- "phonetic": IPA or ""
 
+Do NOT include definitions or phonetics.
 Return ONLY a JSON array. If nothing marked, [].`;
 
 const REGION_TEXT_PROMPT = `Extract the clearest English word(s)/short phrase(s) from this crop.
 Return ONLY a JSON array of:
 - "marked_text"
 - "context" (sentence if visible, else marked_text)
-- "definition" (brief Chinese)
-- "phonetic" (or "")
+
+Do NOT include definitions or phonetics.
 If unreadable, [].`;
+
+const MULTI_REGION_PROMPT = `You are given several tight crops from a book page (user-drawn underlines/circles).
+For EACH image, extract the clearest English word(s)/short phrase(s).
+Return ONLY one JSON array of objects with:
+- "marked_text"
+- "context" (sentence if visible, else marked_text)
+
+Do NOT include definitions or phonetics.
+Deduplicate identical words. If unreadable, skip that image.`;
+
+function stripImageBase64(value) {
+  return String(value || '')
+    .replace(/^data:[^;]+;base64,/, '')
+    .replace(/\s/g, '');
+}
+
+function collectExtractImages(body) {
+  const fromArray = Array.isArray(body?.images) ? body.images : [];
+  const images = fromArray
+    .map((item) => stripImageBase64(item))
+    .filter(Boolean)
+    .slice(0, 8);
+  if (images.length) return images;
+  const single = stripImageBase64(body?.imageBase64);
+  return single ? [single] : [];
+}
+
+function enrichMarkedItem(item) {
+  const marked_text = String(item?.marked_text || item?.markedText || '').trim();
+  const context = String(item?.context || '').trim();
+  if (!marked_text) return null;
+
+  // Prefer the first English word for dictionary lookup when Gemini returns a short phrase.
+  const lookupKey =
+    marked_text
+      .toLowerCase()
+      .match(/[a-z][a-z'-]*/)?.[0] || marked_text.toLowerCase();
+  const ec = lookupEcdict(lookupKey) || lookupEcdict(marked_text);
+
+  return {
+    marked_text,
+    context,
+    definition: ec?.translation || '',
+    phonetic: ec?.phonetic || '',
+    glossEn: ec?.definition || null,
+    pos: ec?.pos || null,
+  };
+}
 
 app.post('/v1/gemini/extract-marked', async (req, res) => {
   try {
-    const imageBase64 = String(req.body?.imageBase64 || '')
-      .replace(/^data:[^;]+;base64,/, '')
-      .replace(/\s/g, '');
-    if (!imageBase64) {
-      res.status(400).json({ error: 'imageBase64_required' });
+    const images = collectExtractImages(req.body);
+    if (!images.length) {
+      res.status(400).json({ error: 'imageBase64_or_images_required' });
       return;
     }
 
-    const prompt = req.body?.regionMode ? REGION_TEXT_PROMPT : MARKED_TEXT_PROMPT;
+    const regionMode = Boolean(req.body?.regionMode) || images.length > 1;
+    const prompt =
+      images.length > 1
+        ? MULTI_REGION_PROMPT
+        : regionMode
+          ? REGION_TEXT_PROMPT
+          : MARKED_TEXT_PROMPT;
+
     const raw = await geminiJson(prompt, {
-      timeoutMs: 90000,
-      image: { data: imageBase64, mimeType: 'image/jpeg' },
+      timeoutMs: 45000,
+      liteOnly: true,
+      maxOutputTokens: 1024,
+      temperature: 0.1,
+      images: images.map((data) => ({ data, mimeType: 'image/jpeg' })),
     });
     const rows = Array.isArray(raw) ? raw : Array.isArray(raw?.items) ? raw.items : [];
-    const items = rows
-      .map((item) => ({
-        marked_text: String(item?.marked_text || item?.markedText || '').trim(),
-        context: String(item?.context || '').trim(),
-        definition: String(item?.definition || '').trim(),
-        phonetic: String(item?.phonetic || '').trim(),
-      }))
-      .filter((item) => item.marked_text);
+    const items = [];
+    const seen = new Set();
+    for (const row of rows) {
+      const item = enrichMarkedItem(row);
+      if (!item) continue;
+      const key = item.marked_text.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      items.push(item);
+    }
     res.json({ items });
   } catch (err) {
     console.error('Gemini marked-text extraction failed', err);
@@ -514,6 +571,29 @@ app.post('/v1/ocr/pen-underlines', async (req, res) => {
   }
 });
 
+function defineFromLocal(word) {
+  const cleaned = String(word || '').trim().toLowerCase();
+  if (!cleaned) return null;
+
+  const ec = lookupEcdict(cleaned);
+  if (ec) {
+    return {
+      word: ec.word || cleaned,
+      phonetic: ec.phonetic || null,
+      pos: ec.pos || null,
+      glossZh: ec.translation || '',
+      glossEn: ec.definition || null,
+      audioUrl: null,
+    };
+  }
+
+  const fallback = FALLBACK[cleaned];
+  if (fallback) {
+    return { ...fallback };
+  }
+  return null;
+}
+
 app.get('/v1/define/:word', async (req, res) => {
   const raw = String(req.params.word || '');
   const word = raw.trim().toLowerCase();
@@ -522,12 +602,7 @@ app.get('/v1/define/:word', async (req, res) => {
     return;
   }
 
-  let row = null;
-  if (db) {
-    row =
-      db.prepare('SELECT * FROM stardict WHERE word = ? COLLATE NOCASE LIMIT 1').get(word) ||
-      db.prepare('SELECT * FROM stardict WHERE sw = ? LIMIT 1').get(stripWord(word));
-  }
+  const local = defineFromLocal(word);
 
   let audioUrl = null;
   try {
@@ -542,25 +617,35 @@ app.get('/v1/define/:word', async (req, res) => {
     // optional
   }
 
-  if (row) {
-    res.json({
-      word: row.word,
-      phonetic: row.phonetic || null,
-      pos: row.pos || null,
-      glossZh: row.translation || '',
-      glossEn: row.definition || null,
-      audioUrl,
-    });
-    return;
-  }
-
-  const fallback = FALLBACK[word];
-  if (fallback) {
-    res.json({ ...fallback, audioUrl: audioUrl ?? fallback.audioUrl });
+  if (local) {
+    res.json({ ...local, audioUrl: audioUrl ?? local.audioUrl ?? null });
     return;
   }
 
   res.status(404).json({ error: 'not_found', word });
+});
+
+/**
+ * Batch local dictionary lookup (ECDICT / starter fallback only).
+ * Body: { words: string[] }
+ */
+app.post('/v1/define-batch', (req, res) => {
+  const input = Array.isArray(req.body?.words) ? req.body.words : [];
+  const words = [];
+  const seen = new Set();
+  for (const raw of input.slice(0, 100)) {
+    const word = String(raw || '').trim().toLowerCase();
+    if (!word || seen.has(word)) continue;
+    seen.add(word);
+    words.push(word);
+  }
+
+  const results = {};
+  for (const word of words) {
+    const hit = defineFromLocal(word);
+    if (hit) results[word] = hit;
+  }
+  res.json({ results });
 });
 
 app.get('/v1/audio/:word', async (req, res) => {

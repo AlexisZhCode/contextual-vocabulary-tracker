@@ -13,6 +13,7 @@ import {
 } from 'react-native';
 
 import { prepareBookChapters } from '../../src/api/booksAi';
+import { PronounceButton } from '../../src/components/PronounceButton';
 import { ScreenHeader } from '../../src/components/ScreenHeader';
 import * as queries from '../../src/db/queries';
 import { colors, radii } from '../../src/theme/colors';
@@ -326,7 +327,22 @@ export default function SourceDetailScreen() {
                     {entry.glossEn}
                   </Text>
                 ) : null}
+                {entry.sentence ? (
+                  <Text style={styles.example} numberOfLines={2}>
+                    “{entry.sentence}”
+                  </Text>
+                ) : null}
               </View>
+              <PronounceButton
+                word={entry.word}
+                audioUrl={entry.audioUrl}
+                onResolved={(audioUrl) => {
+                  void queries.updateEntryAudio(entry.id, audioUrl);
+                  setSavedWords((prev) =>
+                    prev.map((row) => (row.id === entry.id ? { ...row, audioUrl } : row)),
+                  );
+                }}
+              />
               <Ionicons name="chevron-forward" size={18} color={colors.textTertiary} />
             </Pressable>
           ))
@@ -494,6 +510,13 @@ const styles = StyleSheet.create({
   phonetic: { fontSize: 13, color: colors.textTertiary },
   gloss: { marginTop: 4, fontSize: 14, color: colors.textSecondary },
   context: { marginTop: 5, fontSize: 13, lineHeight: 18, color: colors.textTertiary },
+  example: {
+    marginTop: 5,
+    fontSize: 13,
+    lineHeight: 18,
+    color: colors.textTertiary,
+    fontStyle: 'italic',
+  },
   delete: { marginTop: 28, alignItems: 'center', padding: 14 },
   deleteText: { color: colors.danger, fontSize: 16 },
 });

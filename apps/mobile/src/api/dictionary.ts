@@ -55,6 +55,63 @@ async function fetchRemoteEcdict(word: string): Promise<DictionaryResult | null>
   }
 }
 
+/** Pronunciation audio URL for a word (Free Dictionary via API, with direct fallback). */
+export async function fetchWordAudio(rawWord: string): Promise<string | null> {
+  const word = normalizeWord(rawWord);
+  if (!word) return null;
+
+  const base = resolveApiBase();
+  if (base) {
+    try {
+      const data = (await withTimeout(
+        fetchJson(`${base}/v1/audio/${encodeURIComponent(word)}`),
+        4000,
+      )) as { audioUrl?: string | null } | null;
+      if (data?.audioUrl) return data.audioUrl;
+    } catch {
+      // fall through
+    }
+  }
+
+  const free = await withTimeout(fetchFreeDictionary(word), 4000);
+  return free?.audioUrl ?? null;
+}
+
+/** Local ECDICT batch lookup via the API (no public dictionary fan-out). */
+export async function defineBatch(
+  words: string[],
+): Promise<Record<string, DictionaryResult>> {
+  const base = resolveApiBase();
+  const normalized = Array.from(
+    new Set(
+      words
+        .map((w) => normalizeWord(w))
+        .filter(Boolean),
+    ),
+  ).slice(0, 100);
+
+  if (!base || !normalized.length) return {};
+
+  try {
+    const res = await fetch(`${base}/v1/define-batch`, {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        'User-Agent': 'ContextualVocabularyTracker/1.0',
+      },
+      body: JSON.stringify({ words: normalized }),
+    });
+    if (!res.ok) return {};
+    const data = (await res.json()) as {
+      results?: Record<string, DictionaryResult>;
+    };
+    return data.results ?? {};
+  } catch {
+    return {};
+  }
+}
+
 async function fetchFreeDictionary(word: string): Promise<{
   phonetic: string | null;
   glossEn: string | null;

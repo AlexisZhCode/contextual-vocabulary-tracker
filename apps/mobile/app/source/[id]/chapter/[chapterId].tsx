@@ -13,6 +13,7 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { ConfettiBurst } from '../../../../src/components/ConfettiBurst';
+import { PronounceButton } from '../../../../src/components/PronounceButton';
 import { ScreenHeader } from '../../../../src/components/ScreenHeader';
 import * as queries from '../../../../src/db/queries';
 import { colors, radii } from '../../../../src/theme/colors';
@@ -163,10 +164,20 @@ export default function ChapterDetailScreen() {
                 </Text>
                 {entry.sentence ? (
                   <Text style={styles.sentence} numberOfLines={2}>
-                    {entry.sentence}
+                    “{entry.sentence}”
                   </Text>
                 ) : null}
               </View>
+              <PronounceButton
+                word={entry.word}
+                audioUrl={entry.audioUrl}
+                onResolved={(audioUrl) => {
+                  void queries.updateEntryAudio(entry.id, audioUrl);
+                  setEntries((prev) =>
+                    prev.map((row) => (row.id === entry.id ? { ...row, audioUrl } : row)),
+                  );
+                }}
+              />
               <Ionicons name="chevron-forward" size={18} color={colors.textTertiary} />
             </Pressable>
           ))

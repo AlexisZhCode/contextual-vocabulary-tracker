@@ -2,22 +2,20 @@ import * as FileSystem from 'expo-file-system/legacy';
 import * as ImageManipulator from 'expo-image-manipulator';
 
 import { resolveApiBase } from './config';
+import { defineBatch } from './dictionary';
 
 const GEMINI_API_KEY = process.env.EXPO_PUBLIC_GEMINI_API_KEY ?? '';
 
-// Prefer Flash-Lite first (low latency). Keep fuller Flash as fallbacks.
-// Avoid retired ids (gemini-1.5-*, gemini-2.0-*, gemini-2.5-* for many new keys).
-const GEMINI_MODELS = [
+// Extract path: Flash-Lite only for latency. Avoid walking full Flash fallbacks.
+const GEMINI_LITE_MODELS = [
   'gemini-flash-lite-latest',
   'gemini-3.5-flash-lite',
   'gemini-3.1-flash-lite',
-  'gemini-flash-latest',
-  'gemini-3.5-flash',
-  'gemini-3.6-flash',
 ] as const;
 
 const RETRYABLE_STATUSES = new Set([429, 503]);
 const MAX_ATTEMPTS_PER_MODEL = 2;
+const EXTRACT_TIMEOUT_MS = 45000;
 
 function geminiEndpoint(model: string) {
   return `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
@@ -27,21 +25,36 @@ function sleep(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
+function normalizeBase64(base64Image: string) {
+  return base64Image.includes('base64,')
+    ? base64Image.slice(base64Image.indexOf('base64,') + 7)
+    : base64Image.replace(/\s/g, '');
+}
+
 async function extractMarkedTextViaApi(
-  imageBase64: string,
+  images: string[],
   options?: GeminiExtractOptions,
 ): Promise<MarkedTextItem[]> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 90000);
+  const timer = setTimeout(() => controller.abort(), EXTRACT_TIMEOUT_MS);
+  const cleaned = images.map(normalizeBase64).filter(Boolean).slice(0, 8);
   try {
+    const body =
+      cleaned.length === 1
+        ? {
+            imageBase64: cleaned[0],
+            regionMode: Boolean(options?.regionMode),
+          }
+        : {
+            images: cleaned,
+            regionMode: true,
+          };
+
     const res = await fetch(`${resolveApiBase()}/v1/gemini/extract-marked`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       signal: controller.signal,
-      body: JSON.stringify({
-        imageBase64,
-        regionMode: Boolean(options?.regionMode),
-      }),
+      body: JSON.stringify(body),
     });
     const payload = (await res.json().catch(() => ({}))) as {
       items?: MarkedTextItem[];
@@ -67,6 +80,8 @@ export type MarkedTextItem = {
   context: string;
   definition: string;
   phonetic: string;
+  glossEn?: string | null;
+  pos?: string | null;
 };
 
 const MARKED_TEXT_PROMPT = `Extract vocabulary from this book-page photo.
@@ -75,18 +90,26 @@ Find physical marks: underlines, circles, highlights, brackets/boxes.
 For each marked region return JSON objects with:
 - "marked_text": exact marked word/phrase/sentence
 - "context": surrounding sentence
-- "definition": brief Chinese definition
-- "phonetic": IPA or "" 
 
+Do NOT include definitions or phonetics.
 Return ONLY a JSON array. If nothing marked, [].`;
 
 const REGION_TEXT_PROMPT = `Extract the clearest English word(s)/short phrase(s) from this crop.
 Return ONLY a JSON array of:
 - "marked_text"
 - "context" (sentence if visible, else marked_text)
-- "definition" (brief Chinese)
-- "phonetic" (or "")
+
+Do NOT include definitions or phonetics.
 If unreadable, [].`;
+
+const MULTI_REGION_PROMPT = `You are given several tight crops from a book page (user-drawn underlines/circles).
+For EACH image, extract the clearest English word(s)/short phrase(s).
+Return ONLY one JSON array of objects with:
+- "marked_text"
+- "context" (sentence if visible, else marked_text)
+
+Do NOT include definitions or phonetics.
+Deduplicate identical words. If unreadable, skip that image.`;
 
 type GeminiExtractOptions = {
   /** When true, treat the image as a tight crop (drawn mark) instead of a full marked page. */
@@ -101,35 +124,51 @@ export async function extractMarkedText(
   base64Image: string,
   options?: GeminiExtractOptions,
 ): Promise<MarkedTextItem[]> {
-  const raw = base64Image.includes('base64,')
-    ? base64Image.slice(base64Image.indexOf('base64,') + 7)
-    : base64Image.replace(/\s/g, '');
-
+  const raw = normalizeBase64(base64Image);
   if (!raw) {
     throw new Error('No image data provided for Gemini extraction.');
   }
+  return extractMarkedImages([raw], options);
+}
 
+/** One Gemini call for many drawn-mark crops (via API or direct key). */
+export async function extractMarkedTextBatch(
+  base64Images: string[],
+  options?: GeminiExtractOptions,
+): Promise<MarkedTextItem[]> {
+  const cleaned = base64Images.map(normalizeBase64).filter(Boolean).slice(0, 8);
+  if (!cleaned.length) {
+    throw new Error('No image data provided for Gemini extraction.');
+  }
+  return extractMarkedImages(cleaned, { ...options, regionMode: true });
+}
+
+async function extractMarkedImages(
+  images: string[],
+  options?: GeminiExtractOptions,
+): Promise<MarkedTextItem[]> {
   if (!GEMINI_API_KEY) {
-    return extractMarkedTextViaApi(raw, options);
+    return extractMarkedTextViaApi(images, options);
   }
 
-  const prompt = options?.regionMode ? REGION_TEXT_PROMPT : MARKED_TEXT_PROMPT;
+  const prompt =
+    images.length > 1
+      ? MULTI_REGION_PROMPT
+      : options?.regionMode
+        ? REGION_TEXT_PROMPT
+        : MARKED_TEXT_PROMPT;
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 90000);
+  const timer = setTimeout(() => controller.abort(), EXTRACT_TIMEOUT_MS);
 
   try {
     let lastError = 'Gemini request failed.';
-    for (const model of GEMINI_MODELS) {
+    for (const model of GEMINI_LITE_MODELS) {
       const generationConfig: Record<string, unknown> = {
         temperature: 0.1,
-        maxOutputTokens: 2048,
+        maxOutputTokens: 1024,
         responseMimeType: 'application/json',
       };
-      // Lite models reject thinkingConfig (400). Full Flash needs budget 0 to stay fast.
-      if (!/lite/i.test(model)) {
-        generationConfig.thinkingConfig = { thinkingBudget: 0 };
-      }
 
       const requestBody = {
         contents: [
@@ -137,12 +176,12 @@ export async function extractMarkedText(
             role: 'user',
             parts: [
               { text: prompt },
-              {
+              ...images.map((data) => ({
                 inline_data: {
                   mime_type: 'image/jpeg',
-                  data: raw,
+                  data,
                 },
-              },
+              })),
             ],
           },
         ],
@@ -196,7 +235,8 @@ export async function extractMarkedText(
 
         const text =
           payload.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || '';
-        return parseMarkedTextArray(text);
+        const extracted = parseMarkedTextArray(text);
+        return enrichMarkedItemsWithDictionary(extracted);
       }
     }
 
@@ -213,13 +253,40 @@ export async function extractMarkedText(
   }
 }
 
+async function enrichMarkedItemsWithDictionary(
+  items: MarkedTextItem[],
+): Promise<MarkedTextItem[]> {
+  const missing = items
+    .filter((item) => !item.definition && !item.glossEn)
+    .map((item) => item.marked_text);
+  if (!missing.length) return items;
+
+  const results = await defineBatch(missing);
+  return items.map((item) => {
+    if (item.definition || item.glossEn) return item;
+    const key = item.marked_text.toLowerCase();
+    const hit =
+      results[key] ||
+      results[key.match(/[a-z][a-z'-]*/)?.[0] || ''];
+    if (!hit) return item;
+    return {
+      ...item,
+      definition: hit.glossZh || '',
+      phonetic: hit.phonetic || item.phonetic || '',
+      glossEn: hit.glossEn ?? null,
+      pos: hit.pos ?? null,
+    };
+  });
+}
+
 /** Resize a local image URI and return JPEG base64 for Gemini. */
 export async function imageUriToJpegBase64(imageUri: string): Promise<string> {
+  // Keep a roomy max width so phone screenshots stay readable without user resizing.
   const manipulated = await ImageManipulator.manipulateAsync(
     imageUri,
-    [{ resize: { width: 1024 } }],
+    [{ resize: { width: 1280 } }],
     {
-      compress: 0.7,
+      compress: 0.75,
       format: ImageManipulator.SaveFormat.JPEG,
       base64: true,
     },
@@ -253,7 +320,7 @@ export async function cropUriToJpegBase64(
           height: crop.height,
         },
       },
-      { resize: { width: Math.max(280, Math.min(768, crop.width * 1.5)) } },
+      { resize: { width: Math.max(320, Math.min(900, Math.round(crop.width * 1.5))) } },
     ],
     {
       compress: 0.75,
@@ -319,6 +386,8 @@ function parseMarkedTextArray(text: string): MarkedTextItem[] {
       context: String(rec.context ?? '').trim(),
       definition: String(rec.definition ?? '').trim(),
       phonetic: String(rec.phonetic ?? '').trim(),
+      glossEn: rec.glossEn != null ? String(rec.glossEn).trim() || null : null,
+      pos: rec.pos != null ? String(rec.pos).trim() || null : null,
     });
   }
   return out;

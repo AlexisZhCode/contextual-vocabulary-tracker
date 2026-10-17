@@ -1,9 +1,8 @@
-import { Ionicons } from '@expo/vector-icons';
-import { createAudioPlayer } from 'expo-audio';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useEffect, useState } from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
 
+import { PronounceButton } from '../../src/components/PronounceButton';
 import { ScreenHeader } from '../../src/components/ScreenHeader';
 import * as queries from '../../src/db/queries';
 import { colors, radii } from '../../src/theme/colors';
@@ -22,12 +21,6 @@ export default function WordDetailScreen() {
       .then(setEntry)
       .finally(() => setLoading(false));
   }, [id]);
-
-  const playAudio = () => {
-    if (!entry?.audioUrl) return;
-    const player = createAudioPlayer(entry.audioUrl);
-    player.play();
-  };
 
   const onReviewed = async () => {
     if (!entry) return;
@@ -59,18 +52,25 @@ export default function WordDetailScreen() {
       <View style={styles.card}>
         <View style={styles.header}>
           <Text style={styles.word}>{entry.word}</Text>
-          {entry.audioUrl ? (
-            <Pressable onPress={playAudio}>
-              <Ionicons name="volume-high-outline" size={26} color={colors.link} />
-            </Pressable>
-          ) : null}
+          <PronounceButton
+            word={entry.word}
+            audioUrl={entry.audioUrl}
+            size={26}
+            onResolved={(audioUrl) => {
+              setEntry((prev) => (prev ? { ...prev, audioUrl } : prev));
+              void queries.updateEntryAudio(entry.id, audioUrl);
+            }}
+          />
         </View>
         {entry.phonetic ? <Text style={styles.phonetic}>/{entry.phonetic}/</Text> : null}
         {entry.pos ? <Text style={styles.pos}>{entry.pos}</Text> : null}
         <Text style={styles.glossZh}>{entry.glossZh}</Text>
         {entry.glossEn ? <Text style={styles.glossEn}>{entry.glossEn}</Text> : null}
         {entry.sentence ? (
-          <Text style={styles.sentence}>“{entry.sentence}”</Text>
+          <View style={styles.exampleBlock}>
+            <Text style={styles.exampleLabel}>Example</Text>
+            <Text style={styles.sentence}>“{entry.sentence}”</Text>
+          </View>
         ) : null}
         <Pressable style={styles.reviewBtn} onPress={() => void onReviewed()}>
           <Text style={styles.reviewText}>Mark reviewed</Text>
@@ -94,13 +94,20 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     alignItems: 'center',
   },
-  word: { fontSize: 32, fontWeight: '800', textTransform: 'capitalize' },
+  word: { fontSize: 32, fontWeight: '800', textTransform: 'capitalize', flex: 1 },
   phonetic: { color: colors.textSecondary, fontSize: 16 },
   pos: { color: colors.textTertiary, fontStyle: 'italic' },
   glossZh: { marginTop: 10, fontSize: 18, lineHeight: 26 },
   glossEn: { fontSize: 14, lineHeight: 20, color: colors.textSecondary },
+  exampleBlock: { marginTop: 14, gap: 4 },
+  exampleLabel: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: colors.textTertiary,
+    textTransform: 'uppercase',
+    letterSpacing: 0.4,
+  },
   sentence: {
-    marginTop: 14,
     fontSize: 15,
     lineHeight: 22,
     color: colors.textSecondary,
