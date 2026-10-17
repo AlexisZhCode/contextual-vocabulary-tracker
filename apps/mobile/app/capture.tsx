@@ -284,7 +284,7 @@ export default function CaptureScreen() {
       const found = batch[key] || batch[firstWord] || null;
       const glossZh = item.definition || found?.glossZh || '';
       const glossEn = item.glossEn ?? found?.glossEn ?? null;
-      const ok = Boolean(glossZh || glossEn);
+      const hasDefinition = Boolean(glossZh || glossEn);
       const sentence = item.context?.trim() || null;
       return {
         word: found?.word ?? item.marked_text,
@@ -294,8 +294,9 @@ export default function CaptureScreen() {
         glossEn,
         audioUrl: found?.audioUrl ?? null,
         sentence,
-        selected: ok,
-        status: ok ? 'ok' : 'missing',
+        // Always check found words — missing ECDICT gloss must not block save.
+        selected: true,
+        status: hasDefinition ? 'ok' : 'missing',
       };
     });
     setItems(lookedUp);
@@ -304,7 +305,7 @@ export default function CaptureScreen() {
     void (async () => {
       const withAudio = await Promise.all(
         lookedUp.map(async (item) => {
-          if (item.audioUrl || item.status !== 'ok') return item;
+          if (item.audioUrl) return item;
           const audioUrl = await fetchWordAudio(item.word).catch(() => null);
           return audioUrl ? { ...item, audioUrl } : item;
         }),
@@ -586,14 +587,14 @@ export default function CaptureScreen() {
     };
   });
 
-  const selectedCount = items.filter((i) => i.selected && i.status === 'ok').length;
+  const selectedCount = items.filter((i) => i.selected).length;
   const canUndo = strokes.length > 0;
 
   const onSaveSelected = async () => {
     if (!selectedSourceId || saving) return;
-    const toSave = items.filter((i) => i.selected && i.status === 'ok');
+    const toSave = items.filter((i) => i.selected);
     if (toSave.length === 0) {
-      Alert.alert('Nothing to save', 'Select at least one word with a definition.');
+      Alert.alert('Nothing to save', 'Select at least one word.');
       return;
     }
     setSaving(true);
@@ -833,7 +834,7 @@ export default function CaptureScreen() {
                     <Ionicons
                       name={item.selected ? 'checkbox' : 'square-outline'}
                       size={22}
-                      color={item.status === 'ok' ? colors.link : colors.textTertiary}
+                      color={item.selected ? colors.link : colors.textTertiary}
                     />
                     <View style={styles.itemBody}>
                       <View style={styles.itemTitleRow}>
@@ -856,19 +857,17 @@ export default function CaptureScreen() {
                         </Text>
                       ) : null}
                     </View>
-                    {item.status === 'ok' ? (
-                      <PronounceButton
-                        word={item.word}
-                        audioUrl={item.audioUrl}
-                        onResolved={(audioUrl) =>
-                          setItems((prev) =>
-                            prev.map((row) =>
-                              row.word === item.word ? { ...row, audioUrl } : row,
-                            ),
-                          )
-                        }
-                      />
-                    ) : null}
+                    <PronounceButton
+                      word={item.word}
+                      audioUrl={item.audioUrl}
+                      onResolved={(audioUrl) =>
+                        setItems((prev) =>
+                          prev.map((row) =>
+                            row.word === item.word ? { ...row, audioUrl } : row,
+                          ),
+                        )
+                      }
+                    />
                   </Pressable>
                 ))}
 
