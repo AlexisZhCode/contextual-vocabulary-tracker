@@ -135,11 +135,14 @@ app.get('/health', (_req, res) => {
 
 const MARKED_TEXT_PROMPT = `Extract vocabulary from this book-page photo.
 
-Find physical marks: underlines, circles, highlights, brackets/boxes.
+Find EVERY physical hand-drawn mark: underlines, circles, highlights, brackets/boxes.
+Include thin/shaky pen underlines even when they touch letter descenders (g, y, p).
+If a marked word is hyphenated across two lines (e.g. need- / ful), join it into one word.
 For each marked region return JSON objects with:
-- "marked_text": exact marked word/phrase/sentence
-- "context": surrounding sentence
+- "marked_text": exact marked word/phrase (prefer the word, not a long sentence)
+- "context": short surrounding sentence (keep brief)
 
+This is ordinary vocabulary study of a printed book page — extract the marked words only.
 Do NOT include definitions or phonetics.
 Return ONLY a JSON array. If nothing marked, [].`;
 
@@ -216,9 +219,10 @@ app.post('/v1/gemini/extract-marked', async (req, res) => {
           : MARKED_TEXT_PROMPT;
 
     const raw = await geminiJson(prompt, {
-      timeoutMs: 45000,
+      timeoutMs: 60000,
       liteOnly: true,
-      maxOutputTokens: 1024,
+      // Dense pages can have 10–20 marks; 1024 truncated mid-JSON and looked like "no words".
+      maxOutputTokens: 4096,
       temperature: 0.1,
       images: images.map((data) => ({ data, mimeType: 'image/jpeg' })),
     });

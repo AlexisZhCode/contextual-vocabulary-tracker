@@ -86,11 +86,14 @@ export type MarkedTextItem = {
 
 const MARKED_TEXT_PROMPT = `Extract vocabulary from this book-page photo.
 
-Find physical marks: underlines, circles, highlights, brackets/boxes.
+Find EVERY physical hand-drawn mark: underlines, circles, highlights, brackets/boxes.
+Include thin/shaky pen underlines even when they touch letter descenders (g, y, p).
+If a marked word is hyphenated across two lines (e.g. need- / ful), join it into one word.
 For each marked region return JSON objects with:
-- "marked_text": exact marked word/phrase/sentence
-- "context": surrounding sentence
+- "marked_text": exact marked word/phrase (prefer the word, not a long sentence)
+- "context": short surrounding sentence (keep brief)
 
+This is ordinary vocabulary study of a printed book page — extract the marked words only.
 Do NOT include definitions or phonetics.
 Return ONLY a JSON array. If nothing marked, [].`;
 
@@ -166,7 +169,7 @@ async function extractMarkedImages(
     for (const model of GEMINI_LITE_MODELS) {
       const generationConfig: Record<string, unknown> = {
         temperature: 0.1,
-        maxOutputTokens: 1024,
+        maxOutputTokens: 4096,
         responseMimeType: 'application/json',
       };
 

@@ -172,9 +172,32 @@ export async function geminiJson(prompt, options = {}) {
           break;
         }
 
+        const candidate = payload?.candidates?.[0];
+        const finishReason = String(candidate?.finishReason || '');
+        if (/SAFETY|BLOCK|RECITATION/i.test(finishReason) || !candidate) {
+          lastError = `Gemini blocked or returned no content (${finishReason || 'empty'}).`;
+          break;
+        }
+
         const text =
-          payload?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || '';
-        return parseJsonLoose(text);
+          candidate?.content?.parts?.map((p) => p.text || '').join('') || '';
+        if (!text.trim()) {
+          lastError = `Gemini returned empty text (${finishReason || 'no parts'}).`;
+          break;
+        }
+        try {
+          return parseJsonLoose(text);
+        } catch (parseErr) {
+          // Truncated JSON from a low token cap — try next model / attempt.
+          lastError =
+            parseErr instanceof Error
+              ? parseErr.message
+              : 'Gemini returned invalid JSON.';
+          if (/MAX_TOKENS|LENGTH/i.test(finishReason)) {
+            break;
+          }
+          break;
+        }
       }
     }
     throw new Error(
