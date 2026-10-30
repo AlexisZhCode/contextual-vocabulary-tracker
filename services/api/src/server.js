@@ -37,6 +37,47 @@ function stripWord(word) {
   return word.toLowerCase().replace(/[^a-z0-9']/g, '');
 }
 
+/** Candidate dictionary keys: exact, stripped, and simple inflection lemmas. */
+function dictionaryKeyVariants(word) {
+  const cleaned = String(word || '')
+    .trim()
+    .toLowerCase()
+    .match(/[a-z][a-z'-]*/)?.[0];
+  if (!cleaned) return [];
+
+  const variants = new Set([cleaned, stripWord(cleaned)]);
+  const add = (value) => {
+    if (value && value.length >= 3) variants.add(value);
+  };
+
+  if (cleaned.endsWith('ies') && cleaned.length > 4) add(`${cleaned.slice(0, -3)}y`);
+  if (cleaned.endsWith('ves') && cleaned.length > 4) add(`${cleaned.slice(0, -3)}f`);
+  if (cleaned.endsWith('ing') && cleaned.length > 5) {
+    add(cleaned.slice(0, -3));
+    add(`${cleaned.slice(0, -3)}e`);
+  }
+  if (cleaned.endsWith('ied') && cleaned.length > 4) add(`${cleaned.slice(0, -3)}y`);
+  if (cleaned.endsWith('ed') && cleaned.length > 4) {
+    add(cleaned.slice(0, -2));
+    add(cleaned.slice(0, -1));
+  }
+  // abortionists → abortionist; eulogists → eulogist
+  if (cleaned.endsWith('ists') && cleaned.length > 5) add(cleaned.slice(0, -1));
+  if (cleaned.endsWith('es') && cleaned.length > 4) add(cleaned.slice(0, -2));
+  if (cleaned.endsWith('s') && !cleaned.endsWith('ss') && cleaned.length > 3) {
+    add(cleaned.slice(0, -1));
+  }
+  // eulogist / eulogists → eulogy (agent noun → related ECDICT headword)
+  for (const key of [...variants]) {
+    if (key.endsWith('ist') && key.length > 4) {
+      add(`${key.slice(0, -3)}y`);
+      add(key.slice(0, -3));
+    }
+  }
+
+  return [...variants];
+}
+
 function openDb() {
   if (!fs.existsSync(dbPath)) return null;
   return new Database(dbPath, { readonly: true, fileMustExist: true });
@@ -44,12 +85,13 @@ function openDb() {
 
 function lookupEcdict(word) {
   if (!db || !word) return null;
-  const cleaned = String(word).trim().toLowerCase();
-  return (
-    db.prepare('SELECT * FROM stardict WHERE word = ? COLLATE NOCASE LIMIT 1').get(cleaned) ||
-    db.prepare('SELECT * FROM stardict WHERE sw = ? LIMIT 1').get(stripWord(cleaned)) ||
-    null
-  );
+  for (const key of dictionaryKeyVariants(word)) {
+    const hit =
+      db.prepare('SELECT * FROM stardict WHERE word = ? COLLATE NOCASE LIMIT 1').get(key) ||
+      db.prepare('SELECT * FROM stardict WHERE sw = ? LIMIT 1').get(stripWord(key));
+    if (hit) return hit;
+  }
+  return null;
 }
 
 async function searchOpenLibraryCover(title, author) {
@@ -190,15 +232,16 @@ function enrichMarkedItem(item) {
     marked_text
       .toLowerCase()
       .match(/[a-z][a-z'-]*/)?.[0] || marked_text.toLowerCase();
-  const ec = lookupEcdict(lookupKey) || lookupEcdict(marked_text);
+  const local = defineFromLocal(lookupKey) || defineFromLocal(marked_text);
 
   return {
     marked_text,
     context,
-    definition: ec?.translation || '',
-    phonetic: ec?.phonetic || '',
-    glossEn: ec?.definition || null,
-    pos: ec?.pos || null,
+    definition: local?.glossZh || '',
+    phonetic: local?.phonetic || '',
+    glossEn: local?.glossEn || null,
+    pos: local?.pos || null,
+    lookupKey,
   };
 }
 
@@ -237,6 +280,29 @@ app.post('/v1/gemini/extract-marked', async (req, res) => {
       seen.add(key);
       items.push(item);
     }
+
+    // When ECDICT is missing/off, fill Chinese glosses with one Gemini dictionary call.
+    const needGloss = items.filter((item) => !item.definition);
+    if (needGloss.length) {
+      const geminiHits = await defineMissingWithGemini(
+        needGloss.map((item) => item.lookupKey || item.marked_text),
+      );
+      for (const item of needGloss) {
+        const key = String(item.lookupKey || item.marked_text)
+          .trim()
+          .toLowerCase();
+        const hit = geminiHits[key];
+        if (!hit) continue;
+        item.definition = hit.glossZh || item.definition;
+        item.glossEn = item.glossEn || hit.glossEn;
+        item.phonetic = item.phonetic || hit.phonetic || '';
+      }
+    }
+
+    for (const item of items) {
+      delete item.lookupKey;
+    }
+
     res.json({ items });
   } catch (err) {
     console.error('Gemini marked-text extraction failed', err);
@@ -576,7 +642,11 @@ app.post('/v1/ocr/pen-underlines', async (req, res) => {
 });
 
 function defineFromLocal(word) {
-  const cleaned = String(word || '').trim().toLowerCase();
+  const cleaned =
+    String(word || '')
+      .trim()
+      .toLowerCase()
+      .match(/[a-z][a-z'-]*/)?.[0] || String(word || '').trim().toLowerCase();
   if (!cleaned) return null;
 
   const ec = lookupEcdict(cleaned);
@@ -598,6 +668,58 @@ function defineFromLocal(word) {
   return null;
 }
 
+async function defineMissingWithGemini(words) {
+  const missing = words.filter(Boolean).slice(0, 40);
+  if (!missing.length || !process.env.GEMINI_API_KEY) return {};
+
+  const prompt = `You are an English→Chinese learner dictionary.
+For each English word below, return a brief Chinese gloss and a short English definition.
+
+Words: ${JSON.stringify(missing)}
+
+Return ONLY a JSON array of objects:
+[
+  {
+    "word": "exact input word",
+    "phonetic": "IPA or empty string",
+    "glossZh": "brief Chinese definition",
+    "glossEn": "brief English definition"
+  }
+]`;
+
+  try {
+    const raw = await geminiJson(prompt, {
+      timeoutMs: 45000,
+      liteOnly: true,
+      maxOutputTokens: 4096,
+      temperature: 0.1,
+    });
+    const rows = Array.isArray(raw) ? raw : Array.isArray(raw?.items) ? raw.items : [];
+    const results = {};
+    for (const row of rows) {
+      const word = String(row?.word || '')
+        .trim()
+        .toLowerCase();
+      if (!word) continue;
+      const glossZh = String(row?.glossZh || row?.definition || '').trim();
+      const glossEn = String(row?.glossEn || '').trim() || null;
+      if (!glossZh && !glossEn) continue;
+      results[word] = {
+        word,
+        phonetic: String(row?.phonetic || '').trim() || null,
+        pos: null,
+        glossZh: glossZh || '（暂无中文释义）',
+        glossEn,
+        audioUrl: null,
+      };
+    }
+    return results;
+  } catch (err) {
+    console.error('Gemini define-batch fallback failed', err);
+    return {};
+  }
+}
+
 app.get('/v1/define/:word', async (req, res) => {
   const raw = String(req.params.word || '');
   const word = raw.trim().toLowerCase();
@@ -606,7 +728,11 @@ app.get('/v1/define/:word', async (req, res) => {
     return;
   }
 
-  const local = defineFromLocal(word);
+  let local = defineFromLocal(word);
+  if (!local) {
+    const geminiHits = await defineMissingWithGemini([word]);
+    local = geminiHits[word] || geminiHits[dictionaryKeyVariants(word)[0]] || null;
+  }
 
   let audioUrl = null;
   try {
@@ -630,26 +756,48 @@ app.get('/v1/define/:word', async (req, res) => {
 });
 
 /**
- * Batch local dictionary lookup (ECDICT / starter fallback only).
+ * Batch dictionary lookup: ECDICT first, then one Gemini call for misses.
  * Body: { words: string[] }
  */
-app.post('/v1/define-batch', (req, res) => {
-  const input = Array.isArray(req.body?.words) ? req.body.words : [];
-  const words = [];
-  const seen = new Set();
-  for (const raw of input.slice(0, 100)) {
-    const word = String(raw || '').trim().toLowerCase();
-    if (!word || seen.has(word)) continue;
-    seen.add(word);
-    words.push(word);
-  }
+app.post('/v1/define-batch', async (req, res) => {
+  try {
+    const input = Array.isArray(req.body?.words) ? req.body.words : [];
+    const words = [];
+    const seen = new Set();
+    for (const raw of input.slice(0, 100)) {
+      const word =
+        String(raw || '')
+          .trim()
+          .toLowerCase()
+          .match(/[a-z][a-z'-]*/)?.[0] || String(raw || '').trim().toLowerCase();
+      if (!word || seen.has(word)) continue;
+      seen.add(word);
+      words.push(word);
+    }
 
-  const results = {};
-  for (const word of words) {
-    const hit = defineFromLocal(word);
-    if (hit) results[word] = hit;
+    const results = {};
+    const missing = [];
+    for (const word of words) {
+      const hit = defineFromLocal(word);
+      if (hit) results[word] = hit;
+      else missing.push(word);
+    }
+
+    if (missing.length) {
+      const geminiHits = await defineMissingWithGemini(missing);
+      for (const word of missing) {
+        if (geminiHits[word]) results[word] = geminiHits[word];
+      }
+    }
+
+    res.json({ results, ecdict: Boolean(db), geminiFallback: missing.length > 0 });
+  } catch (err) {
+    console.error('define-batch failed', err);
+    res.status(502).json({
+      error: 'define_batch_failed',
+      message: err instanceof Error ? err.message : String(err),
+    });
   }
-  res.json({ results });
 });
 
 app.get('/v1/audio/:word', async (req, res) => {

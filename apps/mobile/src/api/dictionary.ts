@@ -3,7 +3,10 @@ import type { DictionaryResult } from '../types';
 import { resolveApiBase } from './config';
 
 function normalizeWord(word: string) {
-  return word.trim().toLowerCase().replace(/[^a-z0-9'-]/gi, '');
+  // Prefer the first English token so phrases like "illegitimate children" still look up.
+  const trimmed = word.trim().toLowerCase();
+  const first = trimmed.match(/[a-z][a-z'-]*/)?.[0];
+  return first || trimmed.replace(/[^a-z0-9'-]/gi, '');
 }
 
 function stripHtml(html: string) {
