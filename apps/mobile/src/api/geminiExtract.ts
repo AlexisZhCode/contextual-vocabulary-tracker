@@ -90,7 +90,8 @@ Find EVERY physical hand-drawn mark: underlines, circles, highlights, brackets/b
 Include thin/shaky pen underlines even when they touch letter descenders (g, y, p).
 If a marked word is hyphenated across two lines (e.g. need- / ful), join it into one word.
 For each marked region return JSON objects with:
-- "marked_text": exact marked word/phrase (prefer the word, not a long sentence)
+- "marked_text": exact marked word/phrase as printed (prefer the word, not a long sentence)
+- "lemma": dictionary headword — singular noun or base/present-tense verb (e.g. eulogists→eulogist, swinging→swing, suffered→suffer, botched→botch)
 - "context": short surrounding sentence (keep brief)
 
 This is ordinary vocabulary study of a printed book page — extract the marked words only.
@@ -99,7 +100,8 @@ Return ONLY a JSON array. If nothing marked, [].`;
 
 const REGION_TEXT_PROMPT = `Extract the clearest English word(s)/short phrase(s) from this crop.
 Return ONLY a JSON array of:
-- "marked_text"
+- "marked_text": as printed
+- "lemma": singular noun or base/present-tense verb
 - "context" (sentence if visible, else marked_text)
 
 Do NOT include definitions or phonetics.
@@ -108,11 +110,12 @@ If unreadable, [].`;
 const MULTI_REGION_PROMPT = `You are given several tight crops from a book page (user-drawn underlines/circles).
 For EACH image, extract the clearest English word(s)/short phrase(s).
 Return ONLY one JSON array of objects with:
-- "marked_text"
+- "marked_text": as printed
+- "lemma": singular noun or base/present-tense verb
 - "context" (sentence if visible, else marked_text)
 
 Do NOT include definitions or phonetics.
-Deduplicate identical words. If unreadable, skip that image.`;
+Deduplicate by lemma. If unreadable, skip that image.`;
 
 type GeminiExtractOptions = {
   /** When true, treat the image as a tight crop (drawn mark) instead of a full marked page. */

@@ -61,18 +61,11 @@ function dictionaryKeyVariants(word) {
     add(cleaned.slice(0, -2));
     add(cleaned.slice(0, -1));
   }
-  // abortionists → abortionist; eulogists → eulogist
+  // abortionists → abortionist; eulogists → eulogist (keep agent noun, don't map to eulogy)
   if (cleaned.endsWith('ists') && cleaned.length > 5) add(cleaned.slice(0, -1));
   if (cleaned.endsWith('es') && cleaned.length > 4) add(cleaned.slice(0, -2));
   if (cleaned.endsWith('s') && !cleaned.endsWith('ss') && cleaned.length > 3) {
     add(cleaned.slice(0, -1));
-  }
-  // eulogist / eulogists → eulogy (agent noun → related ECDICT headword)
-  for (const key of [...variants]) {
-    if (key.endsWith('ist') && key.length > 4) {
-      add(`${key.slice(0, -3)}y`);
-      add(key.slice(0, -3));
-    }
   }
 
   return [...variants];
@@ -181,7 +174,8 @@ Find EVERY physical hand-drawn mark: underlines, circles, highlights, brackets/b
 Include thin/shaky pen underlines even when they touch letter descenders (g, y, p).
 If a marked word is hyphenated across two lines (e.g. need- / ful), join it into one word.
 For each marked region return JSON objects with:
-- "marked_text": exact marked word/phrase (prefer the word, not a long sentence)
+- "marked_text": exact marked word/phrase as printed (prefer the word, not a long sentence)
+- "lemma": dictionary headword — singular noun or base/present-tense verb (e.g. eulogists→eulogist, swinging→swing, suffered→suffer, botched→botch)
 - "context": short surrounding sentence (keep brief)
 
 This is ordinary vocabulary study of a printed book page — extract the marked words only.
@@ -190,7 +184,8 @@ Return ONLY a JSON array. If nothing marked, [].`;
 
 const REGION_TEXT_PROMPT = `Extract the clearest English word(s)/short phrase(s) from this crop.
 Return ONLY a JSON array of:
-- "marked_text"
+- "marked_text": as printed
+- "lemma": singular noun or base/present-tense verb
 - "context" (sentence if visible, else marked_text)
 
 Do NOT include definitions or phonetics.
@@ -199,11 +194,12 @@ If unreadable, [].`;
 const MULTI_REGION_PROMPT = `You are given several tight crops from a book page (user-drawn underlines/circles).
 For EACH image, extract the clearest English word(s)/short phrase(s).
 Return ONLY one JSON array of objects with:
-- "marked_text"
+- "marked_text": as printed
+- "lemma": singular noun or base/present-tense verb
 - "context" (sentence if visible, else marked_text)
 
 Do NOT include definitions or phonetics.
-Deduplicate identical words. If unreadable, skip that image.`;
+Deduplicate by lemma. If unreadable, skip that image.`;
 
 function stripImageBase64(value) {
   return String(value || '')
@@ -222,26 +218,39 @@ function collectExtractImages(body) {
   return single ? [single] : [];
 }
 
-function enrichMarkedItem(item) {
-  const marked_text = String(item?.marked_text || item?.markedText || '').trim();
-  const context = String(item?.context || '').trim();
-  if (!marked_text) return null;
-
-  // Prefer the first English word for dictionary lookup when Gemini returns a short phrase.
-  const lookupKey =
-    marked_text
+function firstEnglishToken(value) {
+  return (
+    String(value || '')
+      .trim()
       .toLowerCase()
-      .match(/[a-z][a-z'-]*/)?.[0] || marked_text.toLowerCase();
-  const local = defineFromLocal(lookupKey) || defineFromLocal(marked_text);
+      .match(/[a-z][a-z'-]*/)?.[0] || ''
+  );
+}
+
+function enrichMarkedItem(item) {
+  const original = String(item?.marked_text || item?.markedText || '').trim();
+  const context = String(item?.context || '').trim();
+  if (!original) return null;
+
+  // Prefer model lemma (singular noun / base verb); fall back to first token.
+  const lemma =
+    firstEnglishToken(item?.lemma) ||
+    firstEnglishToken(original) ||
+    original.toLowerCase();
+
+  // Look up the lemma in ECDICT (with light inflection variants only).
+  // Do not replace the listed lemma with a different related headword.
+  const local = defineFromLocal(lemma) || defineFromLocal(original);
 
   return {
-    marked_text,
+    // Client lists/saves marked_text — always the lemma form.
+    marked_text: lemma,
     context,
     definition: local?.glossZh || '',
     phonetic: local?.phonetic || '',
     glossEn: local?.glossEn || null,
     pos: local?.pos || null,
-    lookupKey,
+    lookupKey: lemma.toLowerCase(),
   };
 }
 
@@ -275,13 +284,13 @@ app.post('/v1/gemini/extract-marked', async (req, res) => {
     for (const row of rows) {
       const item = enrichMarkedItem(row);
       if (!item) continue;
-      const key = item.marked_text.toLowerCase();
+      const key = item.lookupKey || item.marked_text.toLowerCase();
       if (seen.has(key)) continue;
       seen.add(key);
       items.push(item);
     }
 
-    // When ECDICT is missing/off, fill Chinese glosses with one Gemini dictionary call.
+    // Only words missing from ECDICT get an AI dictionary lookup.
     const needGloss = items.filter((item) => !item.definition);
     if (needGloss.length) {
       const geminiHits = await defineMissingWithGemini(
@@ -673,14 +682,15 @@ async function defineMissingWithGemini(words) {
   if (!missing.length || !process.env.GEMINI_API_KEY) return {};
 
   const prompt = `You are an English→Chinese learner dictionary.
-For each English word below, return a brief Chinese gloss and a short English definition.
+These words were not found in the local dictionary. They are already lemma forms
+(singular nouns / base present-tense verbs) — define them as given.
 
 Words: ${JSON.stringify(missing)}
 
 Return ONLY a JSON array of objects:
 [
   {
-    "word": "exact input word",
+    "word": "exact input lemma",
     "phonetic": "IPA or empty string",
     "glossZh": "brief Chinese definition",
     "glossEn": "brief English definition"
