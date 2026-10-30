@@ -1,8 +1,14 @@
 import { Ionicons } from '@expo/vector-icons';
 import { useEffect, useState } from 'react';
-import { ActivityIndicator, Pressable, StyleSheet, type GestureResponderEvent } from 'react-native';
+import {
+  ActivityIndicator,
+  Platform,
+  Pressable,
+  StyleSheet,
+  type GestureResponderEvent,
+} from 'react-native';
 
-import { playWordPronunciation } from '../api/pronounce';
+import { playWordPronunciation, speakWithWebSpeech } from '../api/pronounce';
 import { colors } from '../theme/colors';
 
 type Props = {
@@ -20,24 +26,29 @@ export function PronounceButton({ word, audioUrl, size = 22, onResolved }: Props
     setUrl(audioUrl ?? null);
   }, [audioUrl, word]);
 
-  const play = async (event?: GestureResponderEvent) => {
+  const play = (event?: GestureResponderEvent) => {
     event?.stopPropagation?.();
     if (loading) return;
-    setLoading(true);
-    try {
-      const resolved = await playWordPronunciation(word, url);
-      if (resolved && resolved !== url) {
-        setUrl(resolved);
-        onResolved?.(resolved);
-      }
-    } finally {
-      setLoading(false);
+
+    // Critical for iPhone PWA: start TTS before any await loses the user-gesture.
+    if (Platform.OS === 'web') {
+      speakWithWebSpeech(word);
     }
+
+    setLoading(true);
+    void playWordPronunciation(word, url)
+      .then((resolved) => {
+        if (resolved && resolved !== url) {
+          setUrl(resolved);
+          onResolved?.(resolved);
+        }
+      })
+      .finally(() => setLoading(false));
   };
 
   return (
     <Pressable
-      onPress={(event) => void play(event)}
+      onPress={play}
       hitSlop={10}
       style={styles.btn}
       accessibilityRole="button"

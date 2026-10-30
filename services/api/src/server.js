@@ -810,25 +810,88 @@ app.post('/v1/define-batch', async (req, res) => {
   }
 });
 
-app.get('/v1/audio/:word', async (req, res) => {
-  const word = String(req.params.word || '').trim().toLowerCase();
+async function resolvePronunciationSource(word) {
+  // 1) Free Dictionary (often flaky)
   try {
     const audioRes = await fetch(
       `https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(word)}`,
     );
-    if (!audioRes.ok) {
-      res.status(404).json({ error: 'not_found' });
-      return;
+    if (audioRes.ok) {
+      const data = await audioRes.json();
+      const audioUrl = data?.[0]?.phonetics?.find((p) => p.audio)?.audio ?? null;
+      if (audioUrl) {
+        return { kind: 'url', audioUrl: audioUrl.startsWith('//') ? `https:${audioUrl}` : audioUrl };
+      }
     }
-    const data = await audioRes.json();
-    const audioUrl = data?.[0]?.phonetics?.find((p) => p.audio)?.audio ?? null;
-    if (!audioUrl) {
-      res.status(404).json({ error: 'not_found' });
-      return;
-    }
-    res.json({ word, audioUrl });
+  } catch {
+    // fall through
+  }
+
+  // 2) Google Translate TTS (public endpoint used as pronunciation fallback)
+  return {
+    kind: 'url',
+    audioUrl: `https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=en&q=${encodeURIComponent(word)}`,
+  };
+}
+
+app.get('/v1/audio/:word', async (req, res) => {
+  const word = String(req.params.word || '')
+    .trim()
+    .toLowerCase()
+    .match(/[a-z][a-z'-]*/)?.[0];
+  if (!word) {
+    res.status(400).json({ error: 'word_required' });
+    return;
+  }
+  try {
+    const source = await resolvePronunciationSource(word);
+    // Prefer same-origin proxied file for the web app (avoids CORS / upstream blocks).
+    const base = `${req.protocol}://${req.get('host')}`;
+    res.json({
+      word,
+      audioUrl: source.audioUrl,
+      fileUrl: `${base}/v1/audio/${encodeURIComponent(word)}/file`,
+    });
   } catch (err) {
     res.status(502).json({ error: 'upstream_failed', message: String(err) });
+  }
+});
+
+/** Stream pronunciation audio through our API (best for the GitHub Pages web app). */
+app.get('/v1/audio/:word/file', async (req, res) => {
+  const word = String(req.params.word || '')
+    .trim()
+    .toLowerCase()
+    .match(/[a-z][a-z'-]*/)?.[0];
+  if (!word) {
+    res.status(400).json({ error: 'word_required' });
+    return;
+  }
+  try {
+    const source = await resolvePronunciationSource(word);
+    const upstream = await fetch(source.audioUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 ContextualVocabularyTracker/1.0',
+        Accept: 'audio/mpeg,audio/*;q=0.9,*/*;q=0.8',
+        Referer: 'https://translate.google.com/',
+      },
+    });
+    if (!upstream.ok) {
+      res.status(502).json({ error: 'upstream_failed', status: upstream.status });
+      return;
+    }
+    const contentType = upstream.headers.get('content-type') || 'audio/mpeg';
+    const buffer = Buffer.from(await upstream.arrayBuffer());
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.send(buffer);
+  } catch (err) {
+    console.error('audio file proxy failed', err);
+    res.status(502).json({
+      error: 'upstream_failed',
+      message: err instanceof Error ? err.message : String(err),
+    });
   }
 });
 
